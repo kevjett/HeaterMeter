@@ -1,6 +1,6 @@
---- package/iwinfo.orig/src/iwinfo_nl80211.c	2012-11-14 14:51:59.279459532 -0500
-+++ package/iwinfo/src/iwinfo_nl80211.c	2012-11-14 14:59:18.129642576 -0500
-@@ -1766,7 +1766,13 @@
+--- package/iwinfo/src/iwinfo_nl80211.orig.c	2013-05-26 08:47:36.471094286 -0400
++++ package/iwinfo/src/iwinfo_nl80211.c	2013-05-26 08:47:42.611094343 -0400
+@@ -1766,7 +1766,13 @@ int nl80211_get_scanlist(const char *ifn
  				goto out;
  
  			if (!iwinfo_ifmac(res))

@@ -7,11 +7,13 @@
 <head>
 <link rel="icon" type="image/x-icon" href="<%=resource%>/favicon.ico">
 <title>HeaterMeter BBQ Control</title>
-<script language="javascript" src="<%=resource%>/js/jquery.min.js" type="text/javascript"></script>
+<script language="javascript" src="<%=resource%>/js/jquery-1.9.1.min.js" type="text/javascript"></script>
 <script language="javascript" src="<%=resource%>/js/jquery.jeditable.mini.js" type="text/javascript"></script>
 <!--[if lte IE 8]><script language="javascript" type="text/javascript" src="<%=resource%>/js/excanvas.min.js"></script><![endif]-->
-<script language="javascript" type="text/javascript" src="<%=resource%>/js/jquery.flot.min.js"></script>
-<script language="javascript" type="text/javascript" src="<%=resource%>/js/jquery.flot.selection.min.js"></script>
+<script language="javascript" type="text/javascript" src="<%=resource%>/js/jquery.flot-0.8.min.js"></script>
+<script language="javascript" type="text/javascript" src="<%=resource%>/js/jquery.flot.selection-0.8.min.js"></script>
+<script language="javascript" type="text/javascript" src="<%=resource%>/js/jquery.flot.time-0.8.min.js"></script>
+<script language="javascript" type="text/javascript" src="<%=resource%>/js/jquery.flot.canvas-0.8.min.js"></script>
 <script language="javascript" type="text/javascript">
 var lastUpdateUtc;
 var lastPlot;
@@ -34,30 +36,33 @@ var graphData =  [
 
     var graphOpts = {
         legend: { show: false },
+        canvas: false,
         series: {
             lines: { show: true, lineWidth: 2 },
             points: { show: false, symbol: "circle", radius: 1, fill: false },
             shadowSize: 4
         },
-        xaxis: { show: true, mode: "time", color: "#ccc" },
-        yaxis: { show: true, ticks: 10, color: "#ccc" },
+        xaxis: { show: true, mode: "time", timezone: "browser",
+          font: { color: "#ccc" } },
+        yaxis: { show: true, ticks: 10, font: { color: "#ccc" } },
         yaxes: [ { }, { position: "right", min: 0, max: 100 } ],
-        grid: { clickable: true, hoverable: true }
+        grid: { clickable: true, hoverable: true, color: "#ccc",
+          borderColor: "#545454" }
     };
     var graphOpts2 = {
         legend: { show: false },
+        canvas: false,
         series: {
             lines: { show: true, lineWidth: 1 },
             points: { show: false },
             shadowSize: 0
         },
-        xaxis: { show: true, mode: "time", color: "#ccc" },
+        xaxis: graphOpts.xaxis,
         yaxis: { show: false },
-        yaxes: [ { }, { min: 0, max: 100 } ],
-        grid: { clickable: false },
+        yaxes: graphOpts.yaxes, 
+        grid: { clickable: false, color: "#ccc", borderColor: "#545454" },
         selection: { mode: "x" }
     };
-    var tzOffset = new Date().getTimezoneOffset() * -60000;
 
 $(document).ready(function()
 {
@@ -71,6 +76,7 @@ $(document).ready(function()
     $("#graph").bind("plothover", graphHover);
     $("#graph").mouseout(function () { $("#graphtt").fadeOut(); });
     $("div.legfill").click(legendClicked);
+    $(document).keydown(keyPressed);
 
     // Set colors of probe readings to match the graph colors
     for (var srs=0; srs<4; ++srs)
@@ -81,11 +87,11 @@ $(document).ready(function()
 <% if context.authuser == "root" then %>
     $(".pname").editable(function(value, settings) {
         return(nameChanged(this.id, value));
-    }, {maxlength: 13});
+    }, {maxlength: 13, select: true});
 
     $("#set").editable(function(value, settings) {
         return(tempChanged(value));
-    }, {style: "display: inline"});
+    }, {style: "display: inline", select: true});
     
     $("#lid").click(function () { 
         if (lastLidOpen == -1) return;
@@ -95,7 +101,7 @@ $(document).ready(function()
     });
     
     $("#alarmclear").click(function () {
-        $(this).html("Disabling...");
+        $(this).html("Silencing...");
         $.get("<%=build_url("admin/lm/set")%>", {al: "0,0,0,0,0,0,0,0"});
     }).show();
         
@@ -125,6 +131,10 @@ $(window).load(function ()
             alarmEvent(o);
         });
         source.addEventListener("error", connectionFailure);
+        source.addEventListener("pidint", function (e) {
+            var o = JSON.parse(e.data);
+            pidIntEvent(o);
+        });
     } else {
         if (!lastUpdateUtc)
             JSONQuery();
@@ -139,7 +149,7 @@ function alarmEvent(o)
   if (o.atype)
   {
     $("#dialog-overlay").show();
-    $("#alarmclear").html("Disable");
+    $("#alarmclear").html("Silence");
     $("#alarm h2").text(o.pn);
     $("#alarm p").html('Alarm (' + o.atype + ') trigged at ' +
       o.c + '&deg; exceeds threshold ' + o.t + '&deg;');
@@ -150,6 +160,55 @@ function alarmEvent(o)
     $("#alarm").hide("fast");
     $("#dialog-overlay").hide();
   }
+}
+
+function keyPressed(e)
+{
+  if (this !== e.target && e.target.type == "text")
+    return;
+  switch (e.which)
+  {
+    case 80: // P
+      togglePidInt();
+      break;
+  }
+}
+
+function togglePidInt()
+{
+  if ($("#pidint").is(":visible"))
+    // Use a timeout on success to make sure the next (final) update
+    // doesn't turn the display back on and leave it on
+    $.get("<%=build_url("admin/lm/set")%>", {tp: 0},
+      function () { $("#pidint").delay(1000).fadeOut('fast'); }
+    );
+  else
+    $.get("<%=build_url("admin/lm/set")%>", {tp: 1});
+}
+
+function pidIntBar(target, val)
+{
+  val = (val > 100) ? 100 : (val < -100) ? -100 : val;
+  if (val > 0)
+    $(target).css({
+      "left": "50%",
+      "width": val/2 + "%",
+      "background-color": "#74b931"});
+  else
+    $(target).css({
+      "left": 50 + val/2 + "%",
+      "width": -val/2 + "%",
+      "background-color": "#ce3b46"});
+}
+
+function pidIntEvent(o)
+{
+  $("#pidint").show('fast');
+  $("#pivb").html(o.b.toFixed(1) + "%"); pidIntBar("#pibb", o.b);
+  $("#pivp").html(o.p.toFixed(1) + "%"); pidIntBar("#pibp", o.p);
+  $("#pivi").html(o.i.toFixed(1) + "%"); pidIntBar("#pibi", o.i);
+  $("#pivd").html(o.d.toFixed(1) + "%"); pidIntBar("#pibd", o.d);
+  $("#pivdt").html(o.t.toFixed(2) + "&deg;");
 }
 
 function legendClicked()
@@ -166,8 +225,14 @@ function refreshGraphData()
     var range = $("#rangeselect").val();
 
     $("#graphtt").fadeOut();
-    $("#rangeselect").attr("disabled", true);
+    $("#rangeselect").prop("disabled", true);
     $("#loadindic").show();
+    if (lastOverviewPlot)
+    {
+      lastOverviewPlot.clearSelection(true);
+      graphOpts.xaxis.min = null;
+      graphOpts.xaxis.max = null;
+    }
     graphLoaded = false;
 
     $.each(graphData, function() {
@@ -175,7 +240,7 @@ function refreshGraphData()
     });
     
     var params = {nancnt: range};
-    <% if rrd then write("params.rrd = '"..rrd.."';") end %>
+    <% if rrd then write("params.rrd = '"..rrd.."'; graphOpts.canvas = true;") end %>
     $.ajax({
         type: "GET",
         url: "<%=build_url("lm/hist")%>",
@@ -194,7 +259,7 @@ function clearLoadingIndic()
 
 function showFanChanged()
 {
-    if ($("#showfan").attr("checked"))
+    if ($("#showfan").prop("checked"))
     {
         graphData[0].lines.show = true;
         graphData[1].lines.show = true;
@@ -207,12 +272,18 @@ function showFanChanged()
     updateGraph();
 }
 
+function doPlot()
+{
+    lastPlot = $.plot($("#graph"), graphData, graphOpts);
+    <% if rrd then write("saveAsPng(lastPlot);") end %>
+}
+
 function updateGraphRanges(from, to)
 {
     $("#graphtt").fadeOut();
     graphOpts.xaxis.min = from;
     graphOpts.xaxis.max = to;
-    $.plot($("#graph"), graphData, graphOpts);
+    doPlot();
 }
 
 function overviewSelected(event, ranges)
@@ -228,14 +299,14 @@ function overviewUnselected()
 function formatTime(date, includeSeconds)
 {
     if (includeSeconds)
-        return $.plot.formatDate(date, "%h:%M:%S %P");
+        return $.plot.formatDate(date, "%l:%M:%S %P");
     else
-        return $.plot.formatDate(date, "%h:%M %P");
+        return $.plot.formatDate(date, "%l:%M %P");
 }
 
 function formatDate(date)
 {
-    return $.plot.formatDate(date, "%y %b %d, %h:%M %P");
+    return $.plot.formatDate(date, "%y %b %d, %l:%M %P");
 }
 
 function formatTimer(secs, includeSeconds)
@@ -398,17 +469,17 @@ function updateGraph()
         selectedArea = lastOverviewPlot.getSelection();
     if (selectedArea && selectedArea.xaxis.to == lastOverviewPlot.getAxes().xaxis.max)
         extendSelection = true;
-        
+    if (selectedArea)
+      lastOverviewPlot.clearSelection(false); 
+      
     lastOverviewPlot = $.plot($("#graph_overview"), graphData, graphOpts2);
     
     if (extendSelection)
         selectedArea.xaxis.to = lastOverviewPlot.getAxes().xaxis.max;
     if (selectedArea)
-        lastOverviewPlot.setSelection(selectedArea, !extendSelection);
-
-    // if we extended selection then it would have been redrawn by the event
-    if (!extendSelection)
-        lastPlot = $.plot($("#graph"), graphData, graphOpts);
+        lastOverviewPlot.setSelection(selectedArea);
+    else
+        doPlot();
 }
 
 function addFanGraphPoint(time, value)
@@ -439,7 +510,7 @@ function tstatSuccess(csv)
         if (this == "") return;
         var line = this.split(",");
         if (line.length != mapCsv.length) return;
-        line[0] = line[0] * 1000 + tzOffset;
+        line[0] = line[0] * 1000;
         for (var valIdx=1; valIdx<line.length; ++valIdx)
         {
             var dest = mapCsv[valIdx];
@@ -530,8 +601,8 @@ function updateLid(val)
 function connectionSuccess(o)
 {
     var updateEditables = ($("form").length == 0);
-    lastUpdateUtc = o.time * 1000;
-    o.time = lastUpdateUtc + tzOffset;
+    o.time *= 1000;
+    lastUpdateUtc = o.time;
     if (updateEditables) $("#set").html(o.set);
 
     if (graphLoaded)
@@ -553,15 +624,16 @@ function connectionSuccess(o)
         else
             tempElem.html(val.toFixed(1) + "&deg;");
             
-        if (o.temps[i].ar == 'H')
+        if (o.temps[i].a.r == 'H')
             tempElem.removeClass("alarmLow").addClass("alarmHigh");
-        else if (o.temps[i].ar == 'L')
+        else if (o.temps[i].a.r == 'L')
             tempElem.removeClass("alarmHigh").addClass("alarmLow");
         else
             tempElem.removeClass("alarmLow alarmHigh");
         
         var dataIdx = mapJson[i];
         graphData[dataIdx].label = o.temps[i].n;
+        graphData[dataIdx].alarm_h = o.temps[i].a.h;
         if (graphLoaded)
             addGraphPoint(graphData[dataIdx].data, o.time, val);
 
@@ -596,7 +668,7 @@ function connectionSuccess(o)
     $("#fanl").html("Blower Speed " + o.fan.c + "%");
     
     updateLid(o.lid);
-    updateTime(o.time);
+    updateTime(lastUpdateUtc); //o.time);
     updateProbeEstimates();
     checkRefreshGraphOrUpdate();
 }
@@ -615,7 +687,7 @@ function updateTime(time)
     if(!time)
     {
         color = "#f33";
-        date = new Date(+new Date() + tzOffset);
+        date = new Date();
     }
     else
         date = new Date(time);
@@ -628,13 +700,14 @@ function updateTime(time)
 
 function degPerHour(probeIdx)
 {
-    var pname = "#dph" + probeIdx; 
+    var pname = "#dph" + probeIdx;
+    var alarm_h = +graphData[mapJson[probeIdx]].alarm_h;
     var data = graphData[mapJson[probeIdx]].data;
     if (data.length != 0 && !isNaN(data[data.length-1][1]))
     {
         var val = data[data.length-1][1];
-       
         var time = data[data.length-1][0];
+        
         // Target is 59mins30secs ago, allows drawing with scale set to 1hr
         var targetTime = time - (60 * 60 * 1000) + 30000;
         for (var i=data.length-1; i>=0; --i)
@@ -647,11 +720,9 @@ function degPerHour(probeIdx)
                 // Don't display if there isn't clear increase, prevents wild numbers
                 if (dph < 1.0)
                     break;
-                var timeRemain180 = ((180.0 - val) / dph) * 3600;
-                timeRemain180 = (timeRemain180 > 0) ? formatTimer(timeRemain180, false) + " to 180&deg;<br />" : "";
-                var timeRemain200 = ((200.0 - val) / dph) * 3600;
-                timeRemain200 = (timeRemain200 > 0) ? formatTimer(timeRemain200, false) + " to 200&deg;" : "";
-                $(pname).html(diffTemp.toFixed(1) + "&deg;/hr<br />" + timeRemain180 + timeRemain200).show();
+                var timeRemain = ((alarm_h - val) / dph) * 3600;
+                timeRemain = (timeRemain > 0) ? formatTimer(timeRemain, false) + " to " + alarm_h + "&deg;<br />" : "";
+                $(pname).html(diffTemp.toFixed(1) + "&deg;/hr<br />" + timeRemain).show();
                 return;
             }
     }  /* if has valid data */
@@ -662,6 +733,36 @@ function updateProbeEstimates()
 {
     for (var i=1; i<4; ++i)
         degPerHour(i);
+}
+
+function plotToPng(plot, background)
+{
+    var csrc = plot.getCanvas();
+    var c = document.createElement("canvas");
+    var ctx = c.getContext("2d");
+    c.width = csrc.width;
+    c.height = csrc.height;
+
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(csrc, 0, 0);
+
+    return c.toDataURL("image/png");
+}
+
+function saveAsPng(p)
+{
+    $("#dl").attr("src", plotToPng(p, "#fff"));
+}
+
+function togglePng()
+{
+    var a, b;
+    if ($("#dl").is(":visible"))
+    { a = "#png"; b = "#graph"; }
+    else
+    { a = "#graph"; b = "#png"; }
+    $(a).fadeOut('fast', function () { $(b).fadeIn('fast'); });
 }
 
 </script>
@@ -692,23 +793,56 @@ div.ptemp { font-size: 32pt; line-height: 26pt; color: #fff; }
 #alarmclear { display: none; position: absolute; bottom: 4px; right: 4px; color: #ccc; }
 div.rfstatus { display: none; position: absolute; left: 0; bottom: 0; 
     width: 16px; height: 16px; background-image: url('<%=resource%>/rf.png'); }
+#pidint { width: 200px; background-color: #fcfcfc; border-radius: 5px; 
+    border: 1px solid #333; position: absolute; font-size: 10pt;
+    bottom: 0px; line-height: 12pt; padding: 3px; display: none; }
+div.pilabel { width: 7%; color: #555; font-weight: bold; float: left; clear: left; }
+div.pival { width: 25%; color: #aaa; text-align: right; float: left; }
+div.pibarcont { position: relative; float: right; width: 65%; border: 1px solid #999;
+    background-color: #f0f0f0; }
+div.pibar { position: relative; }
+div.pipip { position: absolute; left: 50%; top: 0; width: 1px; height: 100%;
+    background-color: #999; }
 </style>
 </head>
 
 <body>
 <div style="background: #000; padding: 10px;">
     <div class="content">
-<% if rrd then %>
-      <h2><%=rrd%></h2>
+<% if rrd then fname = rrd:sub(1, -5) .. ".png"; fshort = nixio.fs.basename(fname) %>
+      <h2 onclick="togglePng();">
+        <img src="<%=resource%>/picture_save.png" alt="save" title="Save graph image">
+        <%=fname%>
+        <img src="<%=resource%>/picture_save.png" alt="save" title="Save graph image">
+      </h2>
 <% else %>
       <div style="font-family: Trebuchet MS; background: #000 url('<%=resource%>/fire.png') repeat-x scroll left bottom;"><div style="background: rgba(76,135,199,0.5);">
-        <div style="color: #bbb; font-size: 28pt;">Current Pit</div>
+        <div style="color: #bbb; font-size: 28pt;">Current <span id="pn0">Pit</span></div>
         <div id="updatedtime" style="position: absolute; top: 8px; right: 13px; color: #bbb; font-size: 12pt;">00:00:00 AM</div>
         <div id="lid" style="position: absolute; top: 8px; left: 13px; color: #bbb; font-size: 12pt;" title="Click to toggle lid mode"></div>
         <div style="font-size: 120pt; line-height: 100pt; color: #fff; position: relative;">
           <span id="temp0">---</span>
           <div style="font-size: 22pt; line-height: 22pt; position: absolute; bottom: 0; right:0;">Set
             <span id="set">---</span>&deg;
+          </div>
+          <div id="pidint">
+            <div class="pibarcont">
+              <div class="pibar" id="pibb">&nbsp;</div>
+              <div class="pibar" id="pibp">&nbsp;</div>
+              <div class="pibar" id="pibi">&nbsp;</div>
+              <div class="pibar" id="pibd">&nbsp;</div>
+              <div class="pipip"></div>
+            </div>
+            <div class="pilabel" style="margin-top: 1px;">B</div>
+            <div class="pival" id="pivb" style="margin-top: 1px;">-%</div>
+            <div class="pilabel">P</div>
+            <div class="pival" id="pivp">-%</div>
+            <div class="pilabel">I</div>
+            <div class="pival" id="pivi">-%</div>
+            <div class="pilabel">D</div>
+            <div class="pival" id="pivd">-%</div>
+            <div class="pilabel">dT</div>
+            <div class="pival" id="pivdt">-&deg;</div>
           </div>
         </div>
 
@@ -750,6 +884,7 @@ div.rfstatus { display: none; position: absolute; left: 0; bottom: 0;
       </div></div>
 <% end %>
       <div style="position: relative;">
+        <div id="png" style="display: none; height: 350px; margin: 8px auto 0px auto;"><img id="dl" alt="<%=fshort%>"></div>
         <div id="graph" style="height: 350px; width: 700px; margin: 8px auto 0px auto;"></div>
         <div id="graph_overview" style="height: 90px; width: 700px; margin-left: auto; margin-right: auto;"></div>
         <div id="loadindic" style="display: none; position: relative; top: -320px; z-index: 2;"><img src="<%=resource%>/loading.gif" style="width: 126px; height: 22px;"></div>

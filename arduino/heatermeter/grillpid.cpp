@@ -1,20 +1,60 @@
 // HeaterMeter Copyright 2011 Bryan Mayland <bmayland@capnbry.net> 
+// GrillPid uses TIMER1 COMPB and OVF vectors, as well as modifies the waveform
+// generation mode of TIMER1. Blower output pin does not need to be a hardware
+// PWM pin.
+// Fan output is 489Hz fast PWM
+// Servo output is 50Hz pulse duration
 #include <math.h>
 #include <string.h>
 
-#include "hmcore.h"
+#include "grillpid.h"
 #include "strings.h"
+
+#if HM_BOARD_REV == 'A'
+#else
+#define GRILLPID_SERVO
+#endif
+
+extern const GrillPid pid;
 
 // The time (ms) of the measurement period
 #define TEMP_MEASURE_PERIOD 1000
 // The temperatures are averaged over 1, 2, 4 or 8 samples per period
 #define TEMP_AVG_COUNT 8
-// 1/(Number of samples used in the exponential moving average)
-#define TEMPPROBE_AVG_SMOOTH (1.0f/20.0f)
-#define FANSPEED_AVG_SMOOTH (1.0f/120.0f)
+// 2/(1+Number of samples used in the exponential moving average)
+#define TEMPPROBE_AVG_SMOOTH (2.0f/(1.0f+60.0f))
+#define PIDOUTPUT_AVG_SMOOTH (2.0f/(1.0f+240.0f))
 // Once entering LID OPEN mode, the minimum number of seconds to stay in
 // LID OPEN mode before autoresuming due to temperature returning to setpoint 
 #define LIDOPEN_MIN_AUTORESUME 30
+
+// Servo refresh period in usec, 20000 usec = 20ms = 50Hz
+#define SERVO_REFRESH          20000
+
+// For this calculation to work, ccpm()/8 must return a round number
+#define uSecToTicks(x) ((unsigned int)(clockCyclesPerMicrosecond() / 8) * x)
+
+// LERP percentage o into the unsigned range [A,B]. B - A must be < 6,553
+#define mappct(o, a, b)  (((b - a) * (unsigned int)o / 100) + a)
+
+#if defined(GRILLPID_SERVO)
+ISR(TIMER1_COMPB_vect)
+{
+  // < Servo refresh means time to turn off output
+  if (TCNT1 < uSecToTicks(SERVO_REFRESH))
+  {
+    digitalWrite(pid.getServoPin(), LOW);
+    OCR1B = uSecToTicks(SERVO_REFRESH);
+  }
+  // Otherwise this is the end of the refresh period, start again
+  else
+  {
+    digitalWrite(pid.getServoPin(), HIGH);
+    OCR1B = pid.getServoOutput();
+    TCNT1 = 0;
+  }
+}
+#endif
 
 static void calcExpMovingAverage(const float smooth, float *currAverage, float newValue)
 {
@@ -29,10 +69,28 @@ static void calcExpMovingAverage(const float smooth, float *currAverage, float n
 
 void ProbeAlarm::updateStatus(int value)
 {
-  if (getLowEnabled() && value <= getLow())
-    Ringing[ALARM_IDX_LOW] = true;
-  if (getHighEnabled() && value >= getHigh())
-    Ringing[ALARM_IDX_HIGH] = true;
+  // Low: Arming point >= Thresh + 1.0f, Trigger point < Thresh
+  // A low alarm set for 100 enables at 101.0 and goes off at 99.9999...
+  if (getLowEnabled())
+  {
+    if (value >= (getLow() + 1))
+      Armed[ALARM_IDX_LOW] = true;
+    else if (value < getLow() && Armed[ALARM_IDX_LOW])
+      Ringing[ALARM_IDX_LOW] = true;
+  }
+
+  // High: Arming point < Thresh - 1.0f, Trigger point >= Thresh
+  // A high alarm set for 100 enables at 98.9999... and goes off at 100.0
+  if (getHighEnabled())
+  {
+    if (value < (getHigh() - 1))
+      Armed[ALARM_IDX_HIGH] = true;
+    else if (value >= getHigh() && Armed[ALARM_IDX_HIGH])
+      Ringing[ALARM_IDX_HIGH] = true;
+  }
+
+  if (pid.isLidOpen())
+    Ringing[ALARM_IDX_LOW] = Ringing[ALARM_IDX_HIGH] = false;
 }
 
 void ProbeAlarm::setHigh(int value)
@@ -47,16 +105,11 @@ void ProbeAlarm::setLow(int value)
 
 void ProbeAlarm::setThreshold(unsigned char idx, int value)
 {
+  Armed[idx] = false;
   Ringing[idx] = false;
-  /* 0 is a special value meaning disable the alarm, i.e. set the threshold negative */
+  /* 0 just means silence */
   if (value == 0)
-  {
-    int oldval = Thresholds[idx];
-    if (oldval < 0)
-      return;
-    else
-      value = -oldval;
-  }
+    return;
   Thresholds[idx] = value;
 }
 
@@ -121,7 +174,14 @@ void TempProbe::calcTemp(void)
   {
     unsigned int ADCval = _accumulator / _accumulatedCount;
     _accumulatedCount = 0;
-  
+
+    // Units 'A' = ADC value
+    if (pid.getUnits() == 'A')
+    {
+      Temperature = ADCval;
+      return;
+    }
+
     if (ADCval != 0)  // Vout >= MAX is reduced in readTemp()
     {
       float R, T;
@@ -171,9 +231,23 @@ void TempProbe::setTemperatureC(float T)
   }
 }
 
-GrillPid::GrillPid(const unsigned char blowerPin) :
-    _blowerPin(blowerPin), _periodCounter(0x80), _units('F'), FanSpeedAvg(NAN)
+GrillPid::GrillPid(const unsigned char fanPin, const unsigned char servoPin) :
+    _fanPin(fanPin), _servoPin(servoPin), _periodCounter(0x80), _units('F'), PidOutputAvg(NAN)
 {
+  //pinMode(_fanPin, OUTPUT); // handled by analogWrite
+#if defined(GRILLPID_SERVO)
+  pinMode(_servoPin, OUTPUT);
+#endif
+}
+
+void GrillPid::init(void) const
+{
+#if defined(GRILLPID_SERVO)
+  // Normal counting, 8 prescale, INT on COMPB
+  TCCR1A = 0;
+  TCCR1B = bit(CS11);
+  TIMSK1 = bit(OCIE1B);
+#endif
 }
 
 unsigned int GrillPid::countOfType(unsigned char probeType) const
@@ -185,78 +259,104 @@ unsigned int GrillPid::countOfType(unsigned char probeType) const
   return retVal;  
 }
 
-/* Calucluate the desired fan speed using the proportional–integral-derivative (PID) controller algorithm */
-inline void GrillPid::calcFanSpeed(void)
+/* Calucluate the desired output percentage using the proportional–integral-derivative (PID) controller algorithm */
+inline void GrillPid::calcPidOutput(void)
 {
-  unsigned char lastFanSpeed = _fanSpeed;
-  _fanSpeed = 0;
+  unsigned char lastOutput = _pidOutput;
+  _pidOutput = 0;
 
   // If the pit probe is registering 0 degrees, don't jack the fan up to MAX
   if (!Probes[TEMP_PIT]->hasTemperature())
     return;
 
-  float currentTemp = Probes[TEMP_PIT]->Temperature;
   // If we're in lid open mode, fan should be off
   if (isLidOpen())
     return;
 
+  float currentTemp = Probes[TEMP_PIT]->Temperature;
   float error;
   error = _setPoint - currentTemp;
 
-  // anti-windup: Make sure we only adjust the I term while
-  // inside the proportional control range
-  if ((error > 0 && lastFanSpeed < _maxFanSpeed) ||
-      (error < 0 && lastFanSpeed > 0))
-    _pidErrorSum += Pid[PIDI] * error;
+  // PPPPP = fan speed percent per degree of error
+  _pidCurrent[PIDP] = Pid[PIDP] * error;
 
-  // B = fan speed percent
-  // P = fan speed percent per degree of error
-  // I = fan speed percent per degree of accumulated error
-  // D = fan speed percent per degree of change over TEMPPROBE_AVG_SMOOTH period
-  float averageTemp = Probes[TEMP_PIT]->TemperatureAvg;
-  int control 
-    = Pid[PIDB] + Pid[PIDP] * error + _pidErrorSum + (Pid[PIDD] * (averageTemp - currentTemp));
-  
-  if (control >= _maxFanSpeed)
-    _fanSpeed = _maxFanSpeed;
-  else if (control > 0)
-    _fanSpeed = control;
+  // IIIII = fan speed percent per degree of accumulated error
+  // anti-windup: Make sure we only adjust the I term while inside the proportional control range
+  if ((error > 0 && lastOutput < 100) || (error < 0 && lastOutput > 0))
+    _pidCurrent[PIDI] += Pid[PIDI] * error;
+
+  // DDDDD = fan speed percent per degree of change over TEMPPROBE_AVG_SMOOTH period
+  _pidCurrent[PIDD] = Pid[PIDD] * (Probes[TEMP_PIT]->TemperatureAvg - currentTemp);
+  // BBBBB = fan speed percent
+  _pidCurrent[PIDB] = Pid[PIDB];
+
+  int control = _pidCurrent[PIDB] + _pidCurrent[PIDP] + _pidCurrent[PIDI] + _pidCurrent[PIDD];
+  _pidOutput = constrain(control, 0, 100);
 }
 
-inline void GrillPid::commitFanSpeed(void)
+unsigned char GrillPid::getFanSpeed(void) const
+{
+  if (bit_is_set(_outputFlags, PIDFLAG_FAN_ONLY_MAX) && _pidOutput < 100)
+    return 0;
+  return (unsigned int)_pidOutput * _maxFanSpeed / 100;
+}
+
+inline void GrillPid::commitFanOutput(void)
 {
   /* Long PWM period is 10 sec */
   const unsigned int LONG_PWM_PERIOD = 10000;
   const unsigned int PERIOD_SCALE = (LONG_PWM_PERIOD / TEMP_MEASURE_PERIOD);
 
-  calcExpMovingAverage(FANSPEED_AVG_SMOOTH, &FanSpeedAvg, _fanSpeed);
-
+  unsigned char fanSpeed = getFanSpeed();
   /* For anything above _minFanSpeed, do a nomal PWM write.
      For below _minFanSpeed we use a "long pulse PWM", where
      the pulse is 10 seconds in length.  For each percent we are
      emulating, run the fan for one interval. */
-  unsigned char output;
-  if (_fanSpeed >= _minFanSpeed)
-  {
-    output = _fanSpeed;
+  if (fanSpeed >= _minFanSpeed)
     _longPwmTmr = 0;
-  }
   else
   {
-    // Simple PWM, ON for first [FanSpeed] intervals then OFF 
+    // Simple PWM, ON for first [FanSpeed] intervals then OFF
     // for the remainder of the period
-    if ((PERIOD_SCALE * _fanSpeed / _minFanSpeed) > _longPwmTmr)
-      output = _minFanSpeed;
+    if (((PERIOD_SCALE * fanSpeed / _minFanSpeed) > _longPwmTmr))
+      fanSpeed = _minFanSpeed;
     else
-      output = 0;
-    
+      fanSpeed = 0;
+
     if (++_longPwmTmr > (PERIOD_SCALE - 1))
       _longPwmTmr = 0;
   }  /* long PWM */
 
-  if (_invertPwm)
+  if (bit_is_set(_outputFlags, PIDFLAG_INVERT_FAN))
+    fanSpeed = _maxFanSpeed - fanSpeed;
+
+  analogWrite(_fanPin, mappct(fanSpeed, 0, 255));
+}
+
+inline void GrillPid::commitServoOutput(void)
+{
+#if defined(GRILLPID_SERVO)
+  unsigned char output;
+  if (bit_is_set(_outputFlags, PIDFLAG_SERVO_ANY_MAX) && _pidOutput > 0)
+    output = 100;
+  else
+    output = _pidOutput;
+
+  if (bit_is_set(_outputFlags, PIDFLAG_INVERT_SERVO))
     output = 100 - output;
-  analogWrite(_blowerPin, (unsigned int)output * 255 / 100);
+
+  // Get the output speed in 10x usec by LERPing between min and max
+  output = mappct(output, _minServoPos, _maxServoPos);
+  // Servo output is actually set on the next interrupt cycle
+  _servoOutput = uSecToTicks(10U * output);
+#endif
+}
+
+inline void GrillPid::commitPidOutput(void)
+{
+  calcExpMovingAverage(PIDOUTPUT_AVG_SMOOTH, &PidOutputAvg, _pidOutput);
+  commitFanOutput();
+  commitServoOutput();
 }
 
 boolean GrillPid::isAnyFoodProbeActive(void) const
@@ -279,20 +379,15 @@ void GrillPid::setSetPoint(int value)
 {
   _setPoint = value;
   _pitTemperatureReached = false;
-  _manualFanMode = false;
-  _pidErrorSum = 0;
+  _manualOutputMode = false;
+  _pidCurrent[PIDI] = 0.0f;
   LidOpenResumeCountdown = 0;
 }
 
-void GrillPid::setFanSpeed(int value)
+void GrillPid::setPidOutput(int value)
 {
-  _manualFanMode = true;
-  if (value < 0)
-    _fanSpeed = 0;
-  else if (value > 100)
-    _fanSpeed = 100;
-  else
-    _fanSpeed = value;
+  _manualOutputMode = true;
+  _pidOutput = constrain(value, 0, 100);
 }
 
 void GrillPid::setLidOpenDuration(unsigned int value)
@@ -305,7 +400,7 @@ void GrillPid::setPidConstant(unsigned char idx, float value)
   Pid[idx] = value;
   if (idx == PIDI)
     // Proably should scale the error sum by newval / oldval instead of resetting
-    _pidErrorSum = 0.0f;
+    _pidCurrent[PIDI] = 0.0f;
 }
 
 void GrillPid::status(void) const
@@ -322,9 +417,9 @@ void GrillPid::status(void) const
     Serial_csv();
   }
 
-  SerialX.print(getFanSpeed(), DEC);
+  SerialX.print(getPidOutput(), DEC);
   Serial_csv();
-  SerialX.print((int)FanSpeedAvg, DEC);
+  SerialX.print((int)PidOutputAvg, DEC);
   Serial_csv();
   SerialX.print(LidOpenResumeCountdown, DEC);
 }
@@ -351,11 +446,11 @@ boolean GrillPid::doWork(void)
   for (unsigned char i=0; i<TEMP_COUNT; i++)
     Probes[i]->calcTemp();
 
-  if (!_manualFanMode)
+  if (!_manualOutputMode)
   {
-    // Always calculate the fan speed
-    // calFanSpeed() will bail if it isn't supposed to be in control
-    calcFanSpeed();
+    // Always calculate the output
+    // calcPidOutput() will bail if it isn't supposed to be in control
+    calcPidOutput();
     
     int pitTemp = (int)Probes[TEMP_PIT]->Temperature;
     if ((pitTemp >= _setPoint) &&
@@ -367,7 +462,7 @@ boolean GrillPid::doWork(void)
       if (!_pitTemperatureReached)
       {
         _pitTemperatureReached = true;
-        _pidErrorSum = 0.0f;
+        _pidCurrent[PIDI] = 0.0f;
       }
       LidOpenResumeCountdown = 0;
     }
@@ -381,12 +476,12 @@ boolean GrillPid::doWork(void)
     // Note that the code assumes we're not currently counting down
     else if (_pitTemperatureReached && 
       (((_setPoint-pitTemp)*100/_setPoint) >= (int)LidOpenOffset) &&
-      ((int)FanSpeedAvg < 90))
+      ((int)PidOutputAvg < 90))
     {
       resetLidOpenResumeCountdown();
     }
   }   /* if !manualFanMode */
-  commitFanSpeed();
+  commitPidOutput();
 
   _periodCounter = 0;  
   return true;
@@ -394,17 +489,26 @@ boolean GrillPid::doWork(void)
 
 void GrillPid::pidStatus(void) const
 {
-  print_P(PSTR("HMPS"CSV_DELIMITER));
-  SerialX.print(_pidErrorSum, 2);
-  Serial_csv();
-  SerialX.print(Probes[TEMP_PIT]->Temperature - Probes[TEMP_PIT]->TemperatureAvg, 2);
-  Serial_nl();
+  TempProbe const* const pit = Probes[TEMP_PIT];
+  if (pit->hasTemperature())
+  {
+    print_P(PSTR("HMPS"CSV_DELIMITER));
+    for (unsigned char i=PIDB; i<=PIDD; ++i)
+    {
+      SerialX.print(_pidCurrent[i], 2);
+      Serial_csv();
+    }
+
+    SerialX.print(pit->Temperature - pit->TemperatureAvg, 2);
+    Serial_nl();
+  }
 }
 
 void GrillPid::setUnits(char units)
 {
   switch (units)
   {
+    case 'A':
     case 'C':
     case 'F':
     case 'R':
@@ -412,4 +516,3 @@ void GrillPid::setUnits(char units)
       break;
   }
 }
-

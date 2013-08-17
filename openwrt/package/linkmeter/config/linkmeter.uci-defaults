@@ -1,5 +1,8 @@
 #!/bin/sh
 
+INSTALL_PARAM="$1"
+[ -z "$INSTALL_PARAM" ] && INSTALL_PARAM="new"
+
 uci_set_nomodify() {
   uci -q get $1 > /dev/null || uci set $1=$2
 }
@@ -7,16 +10,26 @@ uci_set_nomodify() {
 HARDWARE_MODEL=`echo "_, model = luci.sys.sysinfo(); print(model)" | lua -lluci.sys`
 if [ "$HARDWARE_MODEL" = "BCM2708" ] ; then
   SERIAL_DEVICE="/dev/ttyAMA0"
+  STASHPATH="/mnt/mmcblk0p4/stash"
+  AUTOBACK_ACTIVE=5
+  AUTOBACK_INACTIVE=60
   LUCID_THREADS=10
+  LUCID_HTTPS=1
+  LUCI_CCACHE=1
 else
   SERIAL_DEVICE="/dev/ttyS1"
+  STASHPATH="/root"
+  AUTOBACK_ACTIVE=0
+  AUTOBACK_INACTIVE=0
   LUCID_THREADS=2
+  LUCID_HTTPS=0
+  LUCI_CCACHE=0
 fi
 
 # Forced configuration parameters
 uci batch << EOF
 set lucid.main.threadlimit=$LUCID_THREADS
-set lucid.https.enabled=0
+set lucid.https.enabled=$LUCID_HTTPS
 set lucid.lmserver=daemon
 set lucid.lmserver.enabled=1
 set lucid.lmserver.slave=linkmeter
@@ -28,7 +41,9 @@ EOF
 uci_set_nomodify lucid.linkmeter.serial_device $SERIAL_DEVICE
 uci_set_nomodify lucid.linkmeter.serial_baud 38400
 uci_set_nomodify lucid.linkmeter.rrd_file /tmp/hm.rrd
-uci_set_nomodify lucid.linkmeter.stashpath /root
+uci_set_nomodify lucid.linkmeter.stashpath $STASHPATH
+uci_set_nomodify lucid.linkmeter.autoback_active $AUTOBACK_ACTIVE
+uci_set_nomodify lucid.linkmeter.autoback_inactive $AUTOBACK_INACTIVE
 
 uci commit lucid
 
@@ -36,8 +51,31 @@ uci commit lucid
 SA=`uci get luci.sauth.sessiontime`
 if [ "$SA" -eq 3600 ] ; then
   uci set luci.sauth.sessiontime=86400
-  uci commit luci
 fi
 
-# On applicable platforms, avrupdate loads HeaterMeter onto the AVR
-avrupdate
+# Include any alarm scripts in the backup file
+ALARMS="/usr/share/linkmeter/alarm-"
+grep $ALARMS /etc/sysupgrade.conf > /dev/null || \
+  echo "${ALARMS}*" >> /etc/sysupgrade.conf
+
+if [ "$INSTALL_PARAM" = "new" ] ; then
+  uci set luci.ccache.enable=$LUCI_CCACHE
+  uci commit luci
+
+  # On applicable platforms, avrupdate loads HeaterMeter onto the AVR
+  avrupdate
+
+  # Enable the config backup/restore service
+  [ "$HARDWARE_MODEL" = "BCM2708" ] && \
+    /etc/init.d/config_restore enable
+
+  # New install, disable dhcp on the lan interface
+  if [ "$HARDWARE_MODEL" = "BCM2708" ] ; then
+    uci set dhcp.lan.ignore=1
+    uci commit dhcp
+  fi
+
+  # LuCI's fixtime makes the time jump forward twice and the time is never right
+  [ -x "/etc/init.d/luci_fixtime" ] && \
+    /etc/init.d/luci_fixtime disable
+fi

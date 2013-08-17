@@ -4,7 +4,6 @@
 
 #include "strings.h"
 
-//#define HEATERMETER_NETWORKING  // enable wifi interface
 #define HEATERMETER_SERIAL 38400 // enable serial interface
 #define HEATERMETER_RFM12  RF12_915MHZ  // enable RFM12B receiving (433MHZ|868MHZ|915MHZ)
 //#define USE_EXTERNAL_VREF       // Using external 5V as reference to analog inputs
@@ -17,10 +16,6 @@
 #include "serialxor.h"
 #include "grillpid.h"
 #include "hmmenus.h"
-
-#ifdef HEATERMETER_NETWORKING
-#define DFLASH_SERVING          // Serve web pages out of dflash
-#endif
 
 // Analog Pins
 // Number in the comment is physical pin on ATMega328
@@ -38,7 +33,7 @@
 #define PIN_LCD_BACKLGHT 5  // 11
 #define PIN_ALARM        6  // 12
 #define PIN_SOFTRESET    7  // 13 DataFlash SS on WiShield
-#define PIN_LCD_DATA     8  // 14
+#define PIN_SERVO        8  // 14 LCD_DATA on < HM PCB v3.2
 #define PIN_WIRELESS_LED 9  // 15
 #define PIN_SPI_SS      10  // 16
 #define PIN_SPI_MOSI    11  // 17 Can not be changed
@@ -49,11 +44,12 @@ void hmcoreSetup(void);
 void hmcoreLoop(void);
 
 void updateDisplay(void);
-void lcdprint_P(const prog_char *p, const boolean doClear);
+void lcdprint_P(const char PROGMEM *p, const boolean doClear);
 
-void eepromLoadConfig(boolean forceDefault);
+void eepromLoadConfig(unsigned char forceDefault);
 void storeSetPoint(int sp);
 void loadProbeName(unsigned char probeIndex);
+void storeAndReportProbeName(unsigned char probeIndex, const char *name);
 void storeAndReportProbeOffset(unsigned char probeIndex, int offset);
 void storeProbeAlarmOn(unsigned char probeIndex, boolean isHigh, boolean value);
 void storeProbeAlarmVal(unsigned char probeIndex, boolean isHigh, int value);
@@ -61,9 +57,9 @@ void storeAndReportMaxFanSpeed(unsigned char maxFanSpeed);
 void setLcdBacklight(unsigned char lcdBacklight);
 void storeLcdBacklight(unsigned char lcdBacklight);
 void reportLcdParameters(void);
-void Debug_begin(char level = '0');
+void Debug_begin(void);
 #define Debug_end Serial_nl
-void disableRingingAlarm(void);
+void silenceRingingAlarm(void);
 
 #define LIDPARAM_OFFSET 0
 #define LIDPARAM_DURATION 1

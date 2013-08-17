@@ -196,6 +196,10 @@ void ShiftRegLCDBase::createChar_P(uint8_t location, const prog_char *p) {
 
 void ShiftRegLCDBase::digitalWrite(uint8_t pin, uint8_t val)
 {
+  // Only 2 pins (0 and 1) available
+  if (pin > 1)
+    return;
+
   pin = 1 << pin;
   if (val)
     _auxPins |= pin;
@@ -273,6 +277,7 @@ void ShiftRegLCDNative::send4bits(uint8_t value) const
 
 void ShiftRegLCDNative::updateAuxPins(void) const
 {
+  if ( _two_wire ) shiftOut ( _srdata_pin, _srclock_pin, MSBFIRST, 0x00 ); // clear shiftregister
   shiftOut( _srdata_pin, _srclock_pin, MSBFIRST, _auxPins);
 }
 

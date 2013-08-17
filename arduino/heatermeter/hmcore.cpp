@@ -2,50 +2,45 @@
 #include "Arduino.h"
 #include <avr/eeprom.h>
 #include <avr/wdt.h>
+#include <avr/power.h>
 
 #include "hmcore.h"
-
-#ifdef HEATERMETER_NETWORKING
-#include <WiServer.h>  
-#endif
 
 #ifdef HEATERMETER_RFM12
 #include "rfmanager.h"
 #endif
 
-#ifdef DFLASH_SERVING
-#include <dataflash.h>
-#include "flashfiles.h"
-#endif
-
 #include "bigchars.h"
+#include "ledmanager.h"
 
 static TempProbe probe0(PIN_PIT);
 static TempProbe probe1(PIN_FOOD1);
 static TempProbe probe2(PIN_FOOD2);
 static TempProbe probe3(PIN_AMB);
-GrillPid pid(PIN_BLOWER);
+GrillPid pid(PIN_BLOWER, PIN_SERVO);
 
 #ifdef SHIFTREGLCD_NATIVE
-ShiftRegLCD lcd(PIN_LCD_DATA, PIN_LCD_CLK, TWO_WIRE, 2); 
+ShiftRegLCD lcd(PIN_SERVO, PIN_LCD_CLK, TWO_WIRE, 2);
 #else
 ShiftRegLCD lcd(PIN_LCD_CLK, 2);
 #endif /* SHIFTREGLCD_NATIVE */
 
-#ifdef HEATERMETER_NETWORKING
-static boolean g_NetworkInitialized;
-#endif /* HEATERMETER_NETWORKING */
 #ifdef HEATERMETER_SERIAL
 static char g_SerialBuff[64]; 
 #endif /* HEATERMETER_SERIAL */
+
 #ifdef HEATERMETER_RFM12
-static void rfSourceNotify(RFSource &r, RFManager::event e); // prototype
-static RFManager rfmanager(rfSourceNotify);
+static void rfSourceNotify(RFSource &r, unsigned char event); // prototype
+static RFManager rfmanager(&rfSourceNotify);
 static unsigned char rfMap[TEMP_COUNT];
 #endif /* HEATERMETER_RFM12 */
 
+static void ledExecutor(unsigned char led, unsigned char on); // prototype
+static LedManager ledmanager(&ledExecutor);
+
 static unsigned char g_AlarmId; // ID of alarm going off
-static unsigned char g_homeBigProbe;
+static unsigned char g_HomeDisplayMode;
+static unsigned char g_LogPidInternals; // If non-zero then log PID interals
 unsigned char g_LcdBacklight; // 0-100
 
 #define config_store_byte(eeprom_field, src) { eeprom_write_byte((uint8_t *)offsetof(__eeprom_data, eeprom_field), src); }
@@ -67,9 +62,14 @@ static const struct __eeprom_data {
   char pidUnits;
   unsigned char minFanSpeed;  // in percent
   unsigned char maxFanSpeed;  // in percent
-  boolean invertPwm;
-  unsigned char homeBigProbe;
-} DEFAULT_CONFIG PROGMEM = { 
+  unsigned char pidOutputFlags;
+  unsigned char homeDisplayMode;
+  unsigned char unused;
+  unsigned char ledConf[LED_COUNT];
+  unsigned char minServoPos;  // in percent
+  unsigned char maxServoPos;  // in percent
+} DEFAULT_CONFIG[] PROGMEM = {
+ {
   EEPROM_MAGIC,  // magic
   225,  // setpoint
   6,    // lid open offset %
@@ -83,8 +83,13 @@ static const struct __eeprom_data {
   'F',  // Units
   10,   // min fan speed  
   100,  // max fan speed
-  false, // invert PWM
-  0xff   // No bignum home
+  0x00, // PID output flags bitmask
+  0xff, // 2-line home
+  0xff, // unused
+  { LEDSTIMULUS_RfReceive, LEDSTIMULUS_LidOpen, LEDSTIMULUS_FanOn, LEDSTIMULUS_Off },
+  60, // min servo pos = 600us
+  250  // max servo pos = 2500us
+}
 };
 
 // EEPROM address of the start of the probe structs, the 2 bytes before are magic
@@ -137,7 +142,7 @@ static unsigned char getProbeConfigOffset(unsigned char probeIndex, unsigned cha
   return retVal;
 }
 
-void storeProbeName(unsigned char probeIndex, const char *name)
+static void storeProbeName(unsigned char probeIndex, const char *name)
 {
   unsigned char ofs = getProbeConfigOffset(probeIndex, offsetof( __eeprom_probe, name));
   if (ofs != 0)
@@ -165,7 +170,7 @@ void storeSetPoint(int sp)
   }
   else
   {
-    pid.setFanSpeed(-sp);
+    pid.setPidOutput(-sp);
     isManualMode = true;
   }
 
@@ -185,7 +190,7 @@ static void storeProbeOffset(unsigned char probeIndex, int offset)
   if (ofs != 0)
   {
     pid.Probes[probeIndex]->Offset = offset;
-    eeprom_write_byte((uint8_t *)ofs, offset);
+    eeprom_write_byte((unsigned char *)ofs, offset);
   }  
 }
 
@@ -195,7 +200,7 @@ static void storeProbeType(unsigned char probeIndex, unsigned char probeType)
   if (ofs != 0)
   {
     pid.Probes[probeIndex]->setProbeType(probeType);
-    eeprom_write_byte((uint8_t *)ofs, probeType);
+    eeprom_write_byte((unsigned char *)ofs, probeType);
   }
 }
 
@@ -274,16 +279,37 @@ static void storeMaxFanSpeed(unsigned char maxFanSpeed)
   config_store_byte(maxFanSpeed, maxFanSpeed);
 }
 
-static void storeInvertPwm(unsigned char invertPwm)
+static void storeMinServoPos(unsigned char minServoPos)
 {
-  pid.setInvertPwm(invertPwm);
-  config_store_byte(invertPwm, invertPwm);
+  pid.setMinServoPos(minServoPos);
+  config_store_byte(minServoPos, minServoPos);
+}
+
+static void storeMaxServoPos(unsigned char maxServoPos)
+{
+  pid.setMaxServoPos(maxServoPos);
+  config_store_byte(maxServoPos, maxServoPos);
+}
+
+static void storeInvertPidOutput(unsigned char pidOutputFlags)
+{
+  pid.setOutputFlags(pidOutputFlags);
+  config_store_byte(pidOutputFlags, pidOutputFlags);
 }
 
 void storeLcdBacklight(unsigned char lcdBacklight)
 {
   setLcdBacklight(lcdBacklight);
   config_store_byte(lcdBacklight, lcdBacklight);
+}
+
+static void storeLedConf(unsigned char led, unsigned char ledConf)
+{
+  ledmanager.setAssignment(led, ledConf);
+
+  unsigned char *ofs = (unsigned char *)offsetof(__eeprom_data, ledConf);
+  ofs += led;
+  eeprom_write_byte(ofs, ledConf);
 }
 
 static void toneEnable(boolean enable)
@@ -327,7 +353,7 @@ static void lcdPrintBigNum(float val)
   {
     if (uval != 0 || x >= 9)
     {
-      const prog_char *numData = NUMS + ((uval % 10) * 6);
+      const char PROGMEM *numData = NUMS + ((uval % 10) * 6);
 
       x -= C_WIDTH;
       lcd.setCursor(x, 0);
@@ -355,16 +381,22 @@ static void lcdPrintBigNum(float val)
   } while (x != 0);
 }
 
+static boolean isMenuHomeState(void)
+{
+  state_t state = Menus.getState();
+  return (state >= ST_HOME_FOOD1 && state <= ST_HOME_ALARM);
+}
+
 void updateDisplay(void)
 {
   // Updates to the temperature can come at any time, only update 
   // if we're in a state that displays them
   state_t state = Menus.getState();
-  if (state < ST_HOME_FOOD1 || state > ST_HOME_ALARM)
+  if (!isMenuHomeState())
     return;
 
   char buffer[17];
-  unsigned char probeIndex;
+  unsigned char probeIdxLow, probeIdxHigh;
 
   // Fixed pit area
   lcd.setCursor(0, 0);
@@ -376,16 +408,16 @@ void updateDisplay(void)
     else
       lcdprint_P(PSTR("** ALARM HIGH **"), false);
 
-    probeIndex = ALARM_ID_TO_PROBE(g_AlarmId);
+    probeIdxLow = probeIdxHigh = ALARM_ID_TO_PROBE(g_AlarmId);
   }  /* if ST_HOME_ALARM */
   else
   {
     toneEnable(false);
 
     /* Big Number probes overwrite the whole display if it has a temperature */
-    if (g_homeBigProbe != 0xff)
+    if (g_HomeDisplayMode >= TEMP_PIT && g_HomeDisplayMode <= TEMP_AMB)
     {
-      TempProbe *probe = pid.Probes[g_homeBigProbe];
+      TempProbe *probe = pid.Probes[g_HomeDisplayMode];
       if (probe->hasTemperature())
       {
         lcdPrintBigNum(probe->Temperature);
@@ -395,7 +427,7 @@ void updateDisplay(void)
 
     /* Default Pit / Fan Speed first line */
     int pitTemp = pid.Probes[TEMP_PIT]->Temperature;
-    if (!pid.getManualFanMode() && pitTemp == 0)
+    if (!pid.getManualOutputMode() && pitTemp == 0)
       memcpy_P(buffer, LCD_LINE1_UNPLUGGED, sizeof(LCD_LINE1_UNPLUGGED));
     else if (pid.LidOpenResumeCountdown > 0)
       snprintf_P(buffer, sizeof(buffer), PSTR("Pit:%3d"DEGREE"%c Lid%3u"),
@@ -403,7 +435,7 @@ void updateDisplay(void)
     else
     {
       char c1,c2;
-      if (pid.getManualFanMode())
+      if (pid.getManualOutputMode())
       {
         c1 = '^';  // LCD_ARROWUP
         c2 = '^';  // LCD_ARROWDN
@@ -414,32 +446,44 @@ void updateDisplay(void)
         c2 = ']';
       }
       snprintf_P(buffer, sizeof(buffer), PSTR("Pit:%3d"DEGREE"%c %c%3u%%%c"),
-        pitTemp, pid.getUnits(), c1, pid.getFanSpeed(), c2);
+        pitTemp, pid.getUnits(), c1, pid.getPidOutput(), c2);
     }
 
     lcd.print(buffer);
-    probeIndex = state - ST_HOME_FOOD1 + TEMP_FOOD1;
+    // Display mode 0xff is 2-line, which only has space for 1 non-pit value
+    if (g_HomeDisplayMode == 0xff)
+      probeIdxLow = probeIdxHigh = state - ST_HOME_FOOD1 + TEMP_FOOD1;
+    else
+    {
+      // Display mode 0xfe is 4 line home, display 3 other temps there
+      probeIdxLow = TEMP_FOOD1;
+      probeIdxHigh = TEMP_AMB;
+    }
   } /* if !ST_HOME_ALARM */
 
   // Rotating probe display
-  if (probeIndex < TEMP_COUNT)
+  for (unsigned char probeIndex=probeIdxLow; probeIndex<=probeIdxHigh; ++probeIndex)
   {
-    loadProbeName(probeIndex);
-    snprintf_P(buffer, sizeof(buffer), PSTR("%-12s%3d"DEGREE), editString, (int)pid.Probes[probeIndex]->Temperature);
-  }
-  else
-  {
-    // If probeIndex is outside the range (in the case of ST_HOME_NOPROBES)
-    // just fill the bottom line with spaces
-    memset(buffer, ' ', sizeof(buffer));
-    buffer[sizeof(buffer) - 1] = '\0';
-  }
+    if (probeIndex < TEMP_COUNT && pid.Probes[probeIndex]->hasTemperature())
+    {
+      loadProbeName(probeIndex);
+      snprintf_P(buffer, sizeof(buffer), PSTR("%-12s%3d"DEGREE), editString,
+        (int)pid.Probes[probeIndex]->Temperature);
+    }
+    else
+    {
+      // If probeIndex is outside the range (in the case of ST_HOME_NOPROBES)
+      // just fill the bottom line with spaces
+      memset(buffer, ' ', sizeof(buffer));
+      buffer[sizeof(buffer) - 1] = '\0';
+    }
 
-  lcd.setCursor(0, 1);
-  lcd.print(buffer);
+    lcd.setCursor(0, probeIndex - probeIdxLow + 1);
+    lcd.print(buffer);
+  }
 }
 
-void lcdprint_P(const prog_char *p, const boolean doClear)
+void lcdprint_P(const char PROGMEM *p, const boolean doClear)
 {
   if (doClear)
     lcd.clear();
@@ -473,7 +517,7 @@ static void outputCsv(void)
 #endif /* HEATERMETER_SERIAL */
 }
 
-#if defined(HEATERMETER_NETWORKING) || defined(HEATERMETER_SERIAL)
+#if defined(HEATERMETER_SERIAL)
 static void printSciFloat(float f)
 {
   // This function could use a rework, it is pretty expensive
@@ -602,6 +646,12 @@ void storeAndReportProbeOffset(unsigned char probeIndex, int offset)
   reportProbeOffsets();
 }
 
+void storeAndReportProbeName(unsigned char probeIndex, char *name)
+{
+  storeProbeName(probeIndex, name);
+  reportProbeNames();
+}
+
 static void reportVersion(void)
 {
   print_P(PSTR("UCID" CSV_DELIMITER "HeaterMeter" CSV_DELIMITER HM_VERSION));
@@ -623,7 +673,12 @@ void reportLcdParameters(void)
   print_P(PSTR("HMLB" CSV_DELIMITER));
   SerialX.print(g_LcdBacklight, DEC);
   Serial_csv();
-  SerialX.print(g_homeBigProbe, DEC);
+  SerialX.print(g_HomeDisplayMode, DEC);
+  for (unsigned char i=0; i<LED_COUNT; ++i)
+  {
+    Serial_csv();
+    SerialX.print(ledmanager.getAssignment(i), DEC);
+  }
   Serial_nl();
 }
 
@@ -635,8 +690,16 @@ void storeLcdParam(unsigned char idx, int val)
       storeLcdBacklight(val);
       break;
     case 1:
-      g_homeBigProbe = val;
-      config_store_byte(homeBigProbe, g_homeBigProbe);
+      g_HomeDisplayMode = val;
+      config_store_byte(homeDisplayMode, g_HomeDisplayMode);
+      // If we're in home, clear in case we're switching from 4 to 2
+      if (isMenuHomeState())
+        lcd.clear();
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+      storeLedConf(idx - 2, val);
       break;
   }
 }
@@ -649,6 +712,7 @@ static void reportProbeCoeffs(void)
 
 static void reportAlarmLimits(void)
 {
+#ifdef HEATERMETER_SERIAL
   print_P(PSTR("HMAL"));
   for (unsigned char i=0; i<TEMP_COUNT; ++i)
   {
@@ -661,6 +725,7 @@ static void reportAlarmLimits(void)
     if (a.getHighRinging()) Serial_char('H');
   }
   Serial_nl();
+#endif
 }
 
 static void reportFanParams(void)
@@ -670,7 +735,11 @@ static void reportFanParams(void)
   Serial_csv();
   SerialX.print(pid.getMaxFanSpeed(), DEC);
   Serial_csv();
-  SerialX.print((unsigned char)pid.getInvertPwm(), DEC);
+  SerialX.print(pid.getMinServoPos(), DEC);
+  Serial_csv();
+  SerialX.print(pid.getMaxServoPos(), DEC);
+  Serial_csv();
+  SerialX.print(pid.getOutputFlags(), DEC);
   Serial_nl();
 }
 
@@ -752,27 +821,27 @@ static void storeAlarmLimits(unsigned char idx, int val)
   a.setThreshold(alarmIndex, val);
 
   unsigned char ofs = getProbeConfigOffset(probeIndex, offsetof( __eeprom_probe, alarmLow));
-  if (ofs != 0)
+  if (ofs != 0 && val != 0)
   {
-    /* Read the value back because we might have just set it to 'disabled' */
-    int newVal = a.getThreshold(alarmIndex);
-    ofs += alarmIndex * sizeof(newVal);
-    eeprom_write_block(&newVal, (void *)ofs, sizeof(newVal));
+    ofs += alarmIndex * sizeof(val);
+    eeprom_write_block(&val, (void *)ofs, sizeof(val));
   }
 }
 
-void disableRingingAlarm(void)
+void silenceRingingAlarm(void)
 {
+  /*
+  unsigned char probeIndex = ALARM_ID_TO_PROBE(g_AlarmId);
+  ProbeAlarm &a = pid.Probes[probeIndex]->Alarms;
+  unsigned char alarmIndex = ALARM_ID_TO_IDX(g_AlarmId);
+  storeAlarmLimits(g_AlarmId, disable ? -a.getThreshold(alarmIndex) : 0);
+  */
   storeAlarmLimits(g_AlarmId, 0);
   reportAlarmLimits();
 }
 
 static void storeFanParams(unsigned char idx, int val)
 {
-  if (val < 0)
-    val = 0;
-  if (val > 100)
-    val = 100;
   switch (idx)
   {
     case 0:
@@ -782,89 +851,94 @@ static void storeFanParams(unsigned char idx, int val)
       storeMaxFanSpeed(val);
       break;
     case 2:
-      storeInvertPwm((boolean)val);
+      storeMinServoPos(val);
+      break;
+    case 3:
+      storeMaxServoPos(val);
+      break;
+    case 4:
+      storeInvertPidOutput(val);
       break;
   }
 }
 
-/* handleCommandUrl returns true if it consumed the URL */
-static boolean handleCommandUrl(char *URL)
+static void setTempParam(unsigned char idx, int val)
+{
+  switch (idx)
+  {
+    case 0:
+      g_LogPidInternals = val;
+      break;
+  }
+}
+
+static void handleCommandUrl(char *URL)
 {
   unsigned char urlLen = strlen(URL);
   if (strncmp_P(URL, PSTR("set?sp="), 7) == 0) 
   {
     storeSetPoint(atoi(URL + 7));
     storePidUnits(URL[urlLen-1]);
-    return true;
   }
-  if (strncmp_P(URL, PSTR("set?lb="), 7) == 0) 
+  else if (strncmp_P(URL, PSTR("set?lb="), 7) == 0)
   {
     csvParseI(URL + 7, storeLcdParam);
     reportLcdParameters();
-    return true;
   }
-  if (strncmp_P(URL, PSTR("set?ld="), 7) == 0) 
+  else if (strncmp_P(URL, PSTR("set?ld="), 7) == 0)
   {
     csvParseI(URL + 7, storeLidParam);
     reportLidParameters();
-    return true;
   }
-  if (strncmp_P(URL, PSTR("set?po="), 7) == 0)
+  else if (strncmp_P(URL, PSTR("set?po="), 7) == 0)
   {
     csvParseI(URL + 7, storeProbeOffset);
     reportProbeOffsets();
-    return true;
   }
-  if (strncmp_P(URL, PSTR("set?pid"), 7) == 0 && urlLen > 9) 
+  else if (strncmp_P(URL, PSTR("set?pid"), 7) == 0 && urlLen > 9)
   {
     float f = atof(URL + 9);
     storePidParam(URL[7], f);
     reportPidParams();
-    return true;
   }
-  if (strncmp_P(URL, PSTR("set?pn"), 6) == 0 && urlLen > 8) 
+  else if (strncmp_P(URL, PSTR("set?pn"), 6) == 0 && urlLen > 8)
   {
     // Store probe name will only store it if a valid probe number is passed
-    storeProbeName(URL[6] - '0', URL + 8);
-    reportProbeNames();
-    return true;
+    storeAndReportProbeName(URL[6] - '0', URL + 8);
   }
-  if (strncmp_P(URL, PSTR("set?pc"), 6) == 0 && urlLen > 8) 
+  else if (strncmp_P(URL, PSTR("set?pc"), 6) == 0 && urlLen > 8)
   {
     storeProbeCoeff(URL[6] - '0', URL + 8);
-    return true;
   }
-  if (strncmp_P(URL, PSTR("set?al="), 7) == 0)
+  else if (strncmp_P(URL, PSTR("set?al="), 7) == 0)
   {
     csvParseI(URL + 7, storeAlarmLimits);
     reportAlarmLimits();
-    return true;
   }
-  if (strncmp_P(URL, PSTR("set?fn="), 7) == 0)
+  else if (strncmp_P(URL, PSTR("set?fn="), 7) == 0)
   {
     csvParseI(URL + 7, storeFanParams);
     reportFanParams();
-    return true;
   }
-  if (strncmp_P(URL, PSTR("set?tt="), 7) == 0)
+  else if (strncmp_P(URL, PSTR("set?tt="), 7) == 0)
   {
     Menus.displayToast(URL+7);
-    return true;
   }
-  if (strncmp_P(URL, PSTR("config"), 6) == 0) 
+  else if (strncmp_P(URL, PSTR("set?tp="), 7) == 0)
+  {
+    csvParseI(URL + 7, setTempParam);
+  }
+  else if (strncmp_P(URL, PSTR("config"), 6) == 0)
   {
     reportConfig();
-    return true;
   }
-  if (strncmp_P(URL, PSTR("reboot"), 5) == 0)
+  else if (strncmp_P(URL, PSTR("reboot"), 5) == 0)
   {
     reboot();
     // reboot doesn't return
   }
-  
-  return false;
 }
-#endif /* defined(HEATERMETER_NETWORKING) || defined(HEATERMETER_SERIAL) */
+#endif /* defined(HEATERMETER_SERIAL) */
 
 static void outputRfStatus(void)
 {
@@ -873,207 +947,30 @@ static void outputRfStatus(void)
 #endif /* defined(HEATERMETER_SERIAL) && defined(HEATERMETER_RFM12) */
 }
 
-#ifdef HEATERMETER_NETWORKING
-
-#ifdef DFLASH_SERVING 
-#define HTTP_HEADER_LENGTH 19 // "HTTP/1.0 200 OK\r\n\r\n"
-static void sendFlashFile(const struct flash_file_t *file)
-{
-  // Note we mess with the underlying UIP stack to prevent reading the entire
-  // file each time from flash just to discard all but 300 bytes of it
-  // Speeds up an 11kB send by approximately 3x (up to 1.5KB/sec)
-  uip_tcp_appstate_t *app = &(uip_conn->appstate);
-  unsigned int sentBytes = app->ackedCount;
-
-  // The first time through, the buffer contains the header but nothing is acked yet
-  // so don't mess with any of the state, just send the first segment  
-  if (app->ackedCount > 0)
-  {
-   app->cursor = (char *)sentBytes;
-   sentBytes -= HTTP_HEADER_LENGTH;
-  }
-
-  unsigned int page = pgm_read_word(&file->page) + (sentBytes / DATAFLASH_PAGE_BYTES);
-  unsigned int off = sentBytes % DATAFLASH_PAGE_BYTES;
-  unsigned int size = pgm_read_word(&file->size);
-  unsigned int sendSize = size - sentBytes;
-
-  if (sendSize > uip_mss())
-    sendSize = uip_mss();
-   
-  dflash.Cont_Flash_Read_Enable(page, off);
-  while (sendSize-- > 0)
-    WiServer.write(dflash.Cont_Flash_Read());
-  dflash.DF_CS_inactive();
-  
-  // Pretend that we've sent the whole file
-  app->cursor = (char *)(HTTP_HEADER_LENGTH + size);
-}
-#endif  /* DFLASH_SERVING */
-
-static void outputJson(void)
-{
-  WiServer.print_P(PSTR("{\"temps\":["));
-
-  for (unsigned char i=0; i<TEMP_COUNT; ++i)
-  {
-    WiServer.print_P(PSTR("{\"n\":\""));
-    loadProbeName(i);
-    WiServer.print(editString);
-    WiServer.print_P(PSTR("\",\"c\":"));
-    if (pid.Probes[i]->hasTemperature())
-      WiServer.print(pid.Probes[i]->Temperature, 1);
-    else
-      WiServer.print_P(PSTR("null"));
-    WiServer.print_P(PSTR(",\"a\":"));
-    if (pid.Probes[i]->hasTemperatureAvg())
-      WiServer.print(pid.Probes[i]->TemperatureAvg, 2);
-    else
-      WiServer.print_P(PSTR("null"));
-    WiServer.print_P(PSTR("},"));
-  }
-  
-  WiServer.print_P(PSTR("{}],\"set\":"));
-  WiServer.print(pid.getSetPoint(),DEC);
-  WiServer.print_P(PSTR(",\"lid\":"));
-  WiServer.print(pid.LidOpenResumeCountdown,DEC);
-  WiServer.print_P(PSTR(",\"fan\":{\"c\":"));
-  WiServer.print(pid.getFanSpeed(),DEC);
-  WiServer.print_P(PSTR(",\"a\":"));
-  WiServer.print((unsigned char)pid.FanSpeedAvg,DEC);
-  WiServer.print_P(PSTR("}}"));
-}
-
-/*
-  This hexdecode function may look dumb as shit but
-  the logic does this in 4 instructions (8 bytes)
-  instead of 12 instructions
-  if (c == 0)
-    return 0;
-  if (c >= '0' && c <= '9')
-    return c - '0';
-  if (c >= 'A' && c <= 'F')
-    return c - 'A';
-  if (c >= 'a' && c <= 'f')
-    return c - 'a';
-  return (undefined);
-*/
-static unsigned char hexdecode(unsigned char c)
-{
-  // Convert 'a'-'f' to lowercase and '0'-'9' to 0-9
-  c &= 0xcf;
-  if (c > 9)
-    return c - 'A' + 10;
-  return c;
-}
-
-/* In-place URL decoder */
-static void urldecode(char *URL)
-{
-  char *dest = URL;
-  while (true)
-  {
-    *dest = *URL;
-    char ofs = 1;
-
-    switch (*URL)
-    {
-    case 0:
-      return;
-      break;
-
-    case '+':
-      *dest = ' ';
-      break;
-
-    case '%':
-      char c1 = *(URL+1);
-      char c2 = *(URL+2);
-      if (c1 && c2)
-      {
-        *dest = (hexdecode(c1) << 4 | hexdecode(c2));
-        ofs = 3;
-      }
-      break;
-    }  /* switch */
-    URL += ofs;
-    ++dest;
-  }
-}
-
-static boolean sendPage(char* URL)
-{
-  ++URL;  // WARNING: URL no longer has leading '/'
-  urldecode(URL);
-  if (handleCommandUrl(URL))
-  {
-    WiServer.print_P(PSTR("OK\n"));
-    return true;
-  }
-  if (strcmp_P(URL, PSTR("json")) == 0) 
-  {
-    outputJson();
-    return true;    
-  }
-  
-#ifdef DFLASH_SERVING
-  const struct flash_file_t *file = FLASHFILES;
-  while (pgm_read_word(&file->fname))
-  {
-    if (strcmp_P(URL, (const prog_char *)pgm_read_word(&file->fname)) == 0)
-    {
-      sendFlashFile(file);
-      return true;
-    }
-    ++file;
-  }
-#endif  /* DFLASH_SERVING */
-  
-  return false;
-}
-
-#ifdef DFLASH_SERVING
-static void dflashInit(void)
-{
-  // Set the WiFi Slave Select to HIGH (disable) to
-  // prevent it from interferring with the dflash init
-  pinMode(PIN_SPI_SS, OUTPUT);
-  digitalWrite(PIN_SPI_SS, HIGH);
-  dflash.init(PIN_SOFTRESET);  // actually DATAFLASH_SS
-}
-#endif  /* DFLASH_SERVING */
-
-#endif /* HEATERMETER_NETWORKING */
-
 #ifdef HEATERMETER_RFM12
-static void rfSourceNotify(RFSource &r, RFManager::event e)
+static void rfSourceNotify(RFSource &r, unsigned char event)
 {
   for (unsigned char i=0; i<TEMP_COUNT; ++i)
     if ((pid.Probes[i]->getProbeType() == PROBETYPE_RF12) &&
     ((rfMap[i] == RFSOURCEID_ANY) || (rfMap[i] == r.getId()))
     )
     {
-      if (e & (RFManager::Update | RFManager::Remove))
+      if (event == RFEVENT_Remove)
+        pid.Probes[i]->addAdcValue(0);
+      else if (r.isNative())
+        pid.Probes[i]->setTemperatureC(r.Value / 10.0f);
+      else
       {
         unsigned int val = r.Value;
-        if (r.isNative() && val != 0)
-          pid.Probes[i]->setTemperatureC((int)val / 10.0f);
-        else
-        {
-          unsigned char adcBits = rfmanager.getAdcBits();
-          // If the remote is lower resolution then shift it up to our resolution
-          if (adcBits < pid.getAdcBits())
-            val <<= (pid.getAdcBits() - adcBits);
-          pid.Probes[i]->addAdcValue(val);
-        }
+        unsigned char adcBits = rfmanager.getAdcBits();
+        // If the remote is lower resolution then shift it up to our resolution
+        if (adcBits < pid.getAdcBits())
+          val <<= (pid.getAdcBits() - adcBits);
+        pid.Probes[i]->addAdcValue(val);
       }
     } /* if probe is this source */
 
-  // Set the value to 0 so when we remove the source later it
-  // adds a 0 to the adcValue, effectively clearing it
-  r.Value = 0;
-
-  if (e & (RFManager::Add | RFManager::Remove))
+  if (event & (RFEVENT_Add | RFEVENT_Remove))
     outputRfStatus();
 }
 #endif /* HEATERMETER_RFM12 */
@@ -1103,101 +1000,121 @@ static void tone_doWork(void)
 
 static void checkAlarms(void)
 {
+  boolean anyRinging = false;
   for (unsigned char i=0; i<TEMP_COUNT; ++i)
+  {
     for (unsigned char j=ALARM_IDX_LOW; j<=ALARM_IDX_HIGH; ++j)
-      if (!pid.isLidOpen() && pid.Probes[i]->Alarms.Ringing[j])
+    {
+      boolean ringing = pid.Probes[i]->Alarms.Ringing[j];
+      unsigned char alarmId = MAKE_ALARM_ID(i, j);
+      if (ringing)
       {
-        g_AlarmId = MAKE_ALARM_ID(i, j);
-#ifdef HEATERMETER_SERIAL
-        reportAlarmLimits();
-#endif
-        Menus.setState(ST_HOME_ALARM);
-        return;
+        anyRinging = true;
+        g_AlarmId = alarmId;
       }
+      ledmanager.publish(LEDSTIMULUS_Alarm0L + alarmId, ringing);
+    }
+  }
 
-  // No alarms ringing, return to HOME
-  if (Menus.getState() == ST_HOME_ALARM)
+  ledmanager.publish(LEDSTIMULUS_AlarmAny, anyRinging);
+  if (anyRinging)
+  {
+    reportAlarmLimits();
+    Menus.setState(ST_HOME_ALARM);
+  }
+  else if (Menus.getState() == ST_HOME_ALARM)
+    // No alarms ringing, return to HOME
     Menus.setState(ST_HOME_FOOD1);
 }
 
-static void eepromLoadBaseConfig(boolean forceDefault)
+static void eepromLoadBaseConfig(unsigned char forceDefault)
 {
-  struct __eeprom_data config;
-  eeprom_read_block(&config, 0, sizeof(config));
-  forceDefault = forceDefault || config.magic != EEPROM_MAGIC;
-  if (forceDefault)
+  // The compiler likes to join eepromLoadBaseConfig and eepromLoadProbeConfig s
+  // this union saves stack space by reusing the same memory area for both structs
+  union {
+    struct __eeprom_data base;
+    struct __eeprom_probe probe;
+  } config;
+
+  eeprom_read_block(&config.base, 0, sizeof(__eeprom_data));
+  forceDefault = forceDefault || config.base.magic != EEPROM_MAGIC;
+  if (forceDefault != 0)
   {
-    memcpy_P(&config, &DEFAULT_CONFIG, sizeof(__eeprom_data));
-    eeprom_write_block(&config, 0, sizeof(__eeprom_data));  
+    memcpy_P(&config.base, &DEFAULT_CONFIG[forceDefault - 1], sizeof(__eeprom_data));
+    eeprom_write_block(&config.base, 0, sizeof(__eeprom_data));
   }
   
-  pid.setSetPoint(config.setPoint);
-  pid.LidOpenOffset = config.lidOpenOffset;
-  pid.setLidOpenDuration(config.lidOpenDuration);
-  memcpy(pid.Pid, config.pidConstants, sizeof(config.pidConstants));
-  if (config.manualMode)
-    pid.setFanSpeed(0);
-  setLcdBacklight(config.lcdBacklight);
-  pid.setUnits(config.pidUnits == 'C' ? 'C' : 'F');
-  pid.setMaxFanSpeed(config.maxFanSpeed);
-  pid.setMinFanSpeed(config.minFanSpeed);
-  pid.setInvertPwm(config.invertPwm);
-  g_homeBigProbe = config.homeBigProbe;
-  
+  pid.setSetPoint(config.base.setPoint);
+  pid.LidOpenOffset = config.base.lidOpenOffset;
+  pid.setLidOpenDuration(config.base.lidOpenDuration);
+  memcpy(pid.Pid, config.base.pidConstants, sizeof(config.base.pidConstants));
+  if (config.base.manualMode)
+    pid.setPidOutput(0);
+  setLcdBacklight(config.base.lcdBacklight);
 #ifdef HEATERMETER_RFM12
-  memcpy(rfMap, config.rfMap, sizeof(rfMap));
+  memcpy(rfMap, config.base.rfMap, sizeof(rfMap));
 #endif
+  pid.setUnits(config.base.pidUnits == 'C' ? 'C' : 'F');
+  pid.setMinFanSpeed(config.base.minFanSpeed);
+  pid.setMaxFanSpeed(config.base.maxFanSpeed);
+  pid.setOutputFlags(config.base.pidOutputFlags);
+  g_HomeDisplayMode = config.base.homeDisplayMode;
+  pid.setMinServoPos(config.base.minServoPos);
+  pid.setMaxServoPos(config.base.maxServoPos);
+
+  for (unsigned char led = 0; led<LED_COUNT; ++led)
+    ledmanager.setAssignment(led, config.base.ledConf[led]);
 }
 
-static void eepromLoadProbeConfig(boolean forceDefault)
+static void eepromLoadProbeConfig(unsigned char forceDefault)
 {
-  unsigned int magic;
+  // The compiler likes to join eepromLoadBaseConfig and eepromLoadProbeConfig s
+  // this union saves stack space by reusing the same memory area for both structs
+  union {
+    struct __eeprom_data base;
+    struct __eeprom_probe probe;
+  } config;
+
   // instead of this use below because we don't have eeprom_read_word linked yet
-  // magic = eeprom_read_word((uint16_t *)(EEPROM_PROBE_START-sizeof(magic))); 
-  eeprom_read_block(&magic, (void *)(EEPROM_PROBE_START-sizeof(magic)), sizeof(magic));
-  if (magic != EEPROM_MAGIC)
+  //magic = eeprom_read_word((uint16_t *)(EEPROM_PROBE_START-sizeof(magic))); 
+  eeprom_read_block(&config.base, (void *)(EEPROM_PROBE_START-sizeof(config.base.magic)), sizeof(config.base.magic));
+  if (config.base.magic != EEPROM_MAGIC)
   {
-    forceDefault = true;
-    eeprom_write_word((uint16_t *)(EEPROM_PROBE_START-sizeof(magic)), EEPROM_MAGIC);
+    forceDefault = 1;
+    eeprom_write_word((uint16_t *)(EEPROM_PROBE_START-sizeof(config.base.magic)), EEPROM_MAGIC);
   }
     
-  struct  __eeprom_probe config;
   struct  __eeprom_probe *p;
   p = (struct  __eeprom_probe *)(EEPROM_PROBE_START);
   for (unsigned char i=0; i<TEMP_COUNT; ++i)
   {
-    if (forceDefault)
+    if (forceDefault != 0)
     {
-      memcpy_P(&config, &DEFAULT_PROBE_CONFIG, sizeof( __eeprom_probe));
+      memcpy_P(&config.probe, &DEFAULT_PROBE_CONFIG, sizeof( __eeprom_probe));
       // Hardcoded to change the last character of the string instead of [strlen(config.name)-1]
-      config.name[6] = '0' + i;
-      eeprom_write_block(&config, p, sizeof(__eeprom_probe));
+      config.probe.name[6] = '0' + i;
+      eeprom_write_block(&config.probe, p, sizeof(__eeprom_probe));
     }
     else
-      eeprom_read_block(&config, p, sizeof(__eeprom_probe));
+      eeprom_read_block(&config.probe, p, sizeof(__eeprom_probe));
 
-    pid.Probes[i]->loadConfig(&config);
+    pid.Probes[i]->loadConfig(&config.probe);
     ++p;
   }  /* for i<TEMP_COUNT */
 }
 
-void eepromLoadConfig(boolean forceDefault)
+void eepromLoadConfig(unsigned char forceDefault)
 {
-  // These are separated into two functions to prevent needing stack
-  // space for both a __eeprom_data and __eeprom_probe structure
   eepromLoadBaseConfig(forceDefault);
   eepromLoadProbeConfig(forceDefault);
 }
 
 static void blinkLed(void)
 {
-#ifndef HEATERMETER_NETWORKING  
-  pinMode(PIN_WIRELESS_LED, OUTPUT);
-  digitalWrite(PIN_WIRELESS_LED, HIGH);
-  delay(100);
-  digitalWrite(PIN_WIRELESS_LED, LOW);
-  delay(50);
-#endif // !HEATERMETER_NETWORKING
+  // This function only works the first time, when all the LEDs are assigned to
+  // LedStimulus::Off, and OneShot turns them on for one blink
+  ledmanager.publish(LEDSTIMULUS_Off, LEDACTION_OneShot);
+  ledmanager.doWork();
 }
 
 #ifdef HEATERMETER_SERIAL
@@ -1226,11 +1143,9 @@ static void serial_doWork(void)
 #endif  /* HEATERMETER_SERIAL */
 
 /* Starts a debug log output message line, end with Debug_end() */
-void Debug_begin(char level)
+void Debug_begin(void)
 {
-    print_P(PSTR("HMLG" CSV_DELIMITER));
-    Serial_char(level);
-    Serial_csv();
+    print_P(PSTR("HMLG" CSV_DELIMITER "0" CSV_DELIMITER));
 }
 
 static void newTempsAvail(void)
@@ -1242,30 +1157,48 @@ static void newTempsAvail(void)
     
   if ((pidCycleCount % 0x20) == 0)
     outputRfStatus();
-#ifdef PID_DEBUG
-  if ((pidCycleCount % 4) == 0)
-    pid.pidStatus();
-#endif
 
   outputCsv();
   // We want to report the status before the alarm readout so
   // receivers can tell what the value was that caused the alarm
   checkAlarms();
 
+  if (g_LogPidInternals)
+    pid.pidStatus();
+
+  ledmanager.publish(LEDSTIMULUS_Off, LEDACTION_Off);
+  ledmanager.publish(LEDSTIMULUS_LidOpen, pid.isLidOpen());
+  ledmanager.publish(LEDSTIMULUS_FanOn, pid.isOutputActive());
+  ledmanager.publish(LEDSTIMULUS_FanMax, pid.isOutputMaxed());
+  ledmanager.publish(LEDSTIMULUS_PitTempReached, pid.isPitTempReached());
+
 #ifdef HEATERMETER_RFM12
-  rfmanager.sendUpdate(pid.getFanSpeed());
+  rfmanager.sendUpdate(pid.getPidOutput());
 #endif
 }
 
 static void lcdDefineChars(void)
 {
-  for (uint8_t i=0; i<8; ++i)
+  for (unsigned char i=0; i<8; ++i)
     lcd.createChar_P(i, BIG_CHAR_PARTS + (i * 8));
+}
+
+static void ledExecutor(unsigned char led, unsigned char on)
+{
+  switch (led)
+  {
+    case 0:
+      digitalWrite(PIN_WIRELESS_LED, on);
+      break;
+    default:
+      lcd.digitalWrite(led - 1, on);
+      break;
+  }
 }
 
 void hmcoreSetup(void)
 {
-  // BLINK 1: Booted
+  pinMode(PIN_WIRELESS_LED, OUTPUT);
   blinkLed();
   
 #ifdef HEATERMETER_SERIAL
@@ -1277,6 +1210,12 @@ void hmcoreSetup(void)
 #ifdef USE_EXTERNAL_VREF  
   analogReference(EXTERNAL);
 #endif  /* USE_EXTERNAL_VREF */
+  // Disable Analog Comparator
+  ACSR = bit(ACD);
+  // Disable Digital Input on ADC pins
+  DIDR0 = bit(ADC5D) | bit(ADC4D) | bit(ADC3D) | bit(ADC2D) | bit(ADC1D) | bit(ADC0D);
+  // And other unused units
+  power_twi_disable();
 
   // Switch the pin mode first to INPUT with internal pullup
   // to take it to 5V before setting the mode to OUTPUT. 
@@ -1289,27 +1228,15 @@ void hmcoreSetup(void)
   pid.Probes[TEMP_FOOD1] = &probe1;
   pid.Probes[TEMP_FOOD2] = &probe2;
   pid.Probes[TEMP_AMB] = &probe3;
+  pid.init();
 
-  eepromLoadConfig(false);
+  eepromLoadConfig(0);
   lcdDefineChars();
 #ifdef HEATERMETER_RFM12
   checkInitRfManager();
 #endif
 
-#ifdef HEATERMETER_NETWORKING
-  dflashInit();
-  
-  g_NetworkInitialized = readButton() == BUTTON_NONE;
-  if (g_NetworkInitialized)  
-  {
-    Menus.setState(ST_CONNECTING);
-    WiServer.init(sendPage);
-  }
-#endif  /* HEATERMETER_NETWORKING */
   Menus.setState(ST_HOME_NOPROBES);
-
-  // BLINK 2: Initialization complete
-  blinkLed();
 }
 
 void hmcoreLoop(void)
@@ -1319,22 +1246,13 @@ void hmcoreLoop(void)
 #endif /* HEATERMETER_SERIAL */
 
 #ifdef HEATERMETER_RFM12
-  if (rfmanager.doWork()) 
-  {
-    digitalWrite(PIN_WIRELESS_LED, HIGH);
-    delay(10);
-  }
-  else
-    digitalWrite(PIN_WIRELESS_LED, LOW);
+  if (rfmanager.doWork())
+    ledmanager.publish(LEDSTIMULUS_RfReceive, LEDACTION_OneShot);
 #endif /* HEATERMETER_RFM12 */
-
-#ifdef HEATERMETER_NETWORKING 
-  if (g_NetworkInitialized)
-    WiServer.server_task(); 
-#endif /* HEATERMETER_NETWORKING */
 
   Menus.doWork();
   if (pid.doWork())
     newTempsAvail();
   tone_doWork();
+  ledmanager.doWork();
 }

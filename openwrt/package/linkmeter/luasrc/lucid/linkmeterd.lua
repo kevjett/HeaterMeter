@@ -1,4 +1,3 @@
-local io = require "io"
 local os = require "os"
 local rrd = require "rrd" 
 local nixio = require "nixio" 
@@ -16,6 +15,9 @@ module "luci.lucid.linkmeterd"
 local serialPolle
 local statusListeners = {}
 local lastHmUpdate
+local lastAutoback
+local autobackActivePeriod
+local autobackInactivePeriod
 local unkProbe
 
 local rfMap = {}
@@ -27,8 +29,19 @@ local hmConfig
 local segmentCall
 
 local RRD_FILE = uci.cursor():get("lucid", "linkmeter", "rrd_file")
+local RRD_AUTOBACK = "/root/autobackup.rrd"
 
 local function rrdCreate()
+  local status, last = pcall(rrd.last, RRD_AUTOBACK)
+  if status then
+    last = tonumber(last)
+    if last and last <= os.time() then
+      return nixio.fs.copy(RRD_AUTOBACK, RRD_FILE)
+    end
+  else
+    nixio.syslog("err", "RRD last failed:"..last)
+  end
+
  return rrd.create(
    RRD_FILE,
    "--step", "2",
@@ -48,20 +61,25 @@ end
 -- This might look a big hokey but rather than build the string
 -- and discard it every time, just replace the values to reduce
 -- the load on the garbage collector
-local JSON_TEMPLATE = {
+local JSON_TEMPLATE_SRC = {
   '',
   '{"time":', 0,
   ',"set":', 0,
   ',"lid":', 0,
   ',"fan":{"c":', 0, ',"a":', 0,
-  '},"temps":[{"n":"', 'Pit', '","c":', 0, ',"ar":', 'null', '', -- probe1
-  '},{"n":"', 'Food Probe1', '","c":', 0, ',"ar":', 'null', '', -- probe2
-  '},{"n":"', 'Food Probe2', '","c":', 0, ',"ar":', 'null', '', -- probe3
-  '},{"n":"', 'Ambient', '","c":', 0, ',"ar":', 'null', '', -- probe4
-  '}]}',
+  '},"temps":[{"n":"', 'Pit', '","c":', 0, '',
+    ',"a":{"l":', 'null', ',"h":', 'null', ',"r":', 'null',
+  '}},{"n":"', 'Food Probe1', '","c":', 0, '',
+    ',"a":{"l":', 'null', ',"h":', 'null', ',"r":', 'null',
+  '}},{"n":"', 'Food Probe2', '","c":', 0, '',
+    ',"a":{"l":', 'null', ',"h":', 'null', ',"r":', 'null',
+  '}},{"n":"', 'Ambient', '","c":', 0, '',
+    ',"a":{"l":', 'null', ',"h":', 'null', ',"r":', 'null',
+  '}}]}',
   ''
 }
-local JSON_FROM_CSV = {3, 5, 15, 22, 29, 36, 9, 11, 7 }
+local JSON_TEMPLATE
+local JSON_FROM_CSV = {3, 5, 15, 26, 37, 48, 9, 11, 7 }
 
 local function jsonWrite(vals)
   local i,v
@@ -83,7 +101,7 @@ local function jsonWrite(vals)
     else
       rfval = ''
     end
-    JSON_TEMPLATE[11+(i*7)] = rfval
+    JSON_TEMPLATE[5+(i*11)] = rfval
   end
 end
 
@@ -104,7 +122,7 @@ local function broadcastStatus(fn)
 end
 
 local function buildConfigMap()
-  if not hmConfig then return end
+  if not hmConfig then return {} end
 
   local r = {}
   for k,v in pairs(hmConfig) do
@@ -114,7 +132,7 @@ local function buildConfigMap()
   if JSON_TEMPLATE[3] ~= 0 then
     -- Current temperatures
     for i = 0, 3 do
-      r["pcurr"..i] = tonumber(JSON_TEMPLATE[15+(i*7)])
+      r["pcurr"..i] = tonumber(JSON_TEMPLATE[15+(i*11)])
     end
     -- Setpoint
     r["sp"] = JSON_TEMPLATE[5]
@@ -163,11 +181,24 @@ local function segLogMessage(line)
   lastLogMessage = line
   broadcastStatus(stsLogMessage)
 end
+
+local lastPidInternals
+local function stsPidInternals()
+  local vals = segSplit(lastPidInternals)
+  return ('event: pidint\ndata: {"b":%s,"p":%s,"i":%s,"d":%s,"t":%s}\n\n')
+    :format(vals[1], vals[2], vals[3], vals[4], vals[5])
+end
+
+local function segPidInternals(line)
+  lastPidInternals = line
+  broadcastStatus(stsPidInternals)
+end
           
 local function segConfig(line, names, numeric)
   local vals = segSplit(line)
-  if #vals < #names then return end
   for i, v in ipairs(names) do
+    if i > #vals then break end
+
     if v ~= "" then
       if numeric then
         hmConfig[v] = tonumber(vals[i])
@@ -181,11 +212,10 @@ end
 
 local function segProbeNames(line)
   local vals = segConfig(line, {"pn0", "pn1", "pn2", "pn3"})
-  
-  JSON_TEMPLATE[13] = vals[1]
-  JSON_TEMPLATE[20] = vals[2]
-  JSON_TEMPLATE[27] = vals[3]
-  JSON_TEMPLATE[34] = vals[4]
+ 
+  for i,v in ipairs(vals) do
+    JSON_TEMPLATE[2+i*11] = v
+  end
 end
 
 local function segProbeOffsets(line)
@@ -201,7 +231,7 @@ local function segLidParams(line)
 end
 
 local function segFanParams(line)
-  return segConfig(line, {"fmin", "fmax", "finv"}, true)
+  return segConfig(line, {"fmin", "fmax", "smin", "smax", "oflag"}, true)
 end
 
 local function segProbeCoeffs(line)
@@ -210,7 +240,7 @@ local function segProbeCoeffs(line)
 end
 
 local function segLcdBacklight(line)
-  return segConfig(line, {"lb", "lbn"})
+  return segConfig(line, {"lb", "lbn", "le0", "le1", "le2", "le3"})
 end
 
 local function segRfUpdate(line)
@@ -263,7 +293,7 @@ end
 
 function stsLmStateUpdate()
   JSON_TEMPLATE[1] = "event: hmstatus\ndata: "
-  JSON_TEMPLATE[41] = "\n\n"
+  JSON_TEMPLATE[#JSON_TEMPLATE] = "\n\n"
   return table.concat(JSON_TEMPLATE)
 end
 
@@ -271,43 +301,84 @@ local lastIpCheck
 local lastIp
 local function checkIpUpdate()
   local newIp
-  -- We can only display 1 IP address so hopefully the last "up" interface
-  -- in the interface list is the most relevant
-  for _,v in pairs(nixio.getifaddrs()) do
-    if not v.flags['loopback'] and v.flags['up'] and
-      v.family == "inet" and v.addr ~= "" then
-      newIp = v.addr end
+  local ifaces = nixio.getifaddrs()
+  local packets = {}
+  -- First find out how many packets have been sent on each interface
+  -- from the packet family instance of each adapter
+  for _,v in ipairs(ifaces) do
+    if not v.flags.loopback and v.family == "packet" then
+      packets[v.name] = v.data.tx_packets
+    end
   end
-  
+
+  -- Static interfaces are always 'up' just not 'running' but nixio does not
+  -- have a flag for running so look for an interface that has sent packets
+  for _,v in ipairs(ifaces) do
+    if not v.flags.loopback and v.flags.up and
+      v.family == "inet" and packets[v.name] > 0 then
+      newIp = v.addr
+    end
+  end
+
   if newIp and newIp ~= lastIp then
     serialPolle.fd:write("/set?tt=Network Address,"..newIp.."\n")
     lastIp = newIp
   end
 end
 
+local function checkAutobackup(now, vals)
+  -- vals is the last status update
+  local pit = tonumber(vals[3])
+  if (autobackActivePeriod ~= 0 and pit and
+    now - lastAutoBackup > (autobackActivePeriod * 60)) or
+    (autobackInactivePeriod ~= 0 and
+    now - lastAutoBackup > (autobackInactivePeriod * 60)) then
+    nixio.fs.copy(RRD_FILE, RRD_AUTOBACK)
+
+    lastAutoBackup = now
+  end
+end
+
 local lastStateUpdate
-local spareUpdates = 0
-local skippedUpdates = 2
+local spareUpdates
+local skippedUpdates
+local function unthrottleUpdates()
+  -- Forces the next two segStateUpdate()s to be unthrottled, which
+  -- can be used to make sure any data changed is pushed out to clients
+  -- instead of being eaten by the throttle. Send 2 because the first one
+  -- is likely to be mid-period already
+  skippedUpdates = 99
+  spareUpdates = 2
+end
+
 local function throttleUpdate(line)
-  -- SLOW: If (line) is the same, only every third update
+  -- Max updates that can be sent in a row
+  local MAX_SEQUENTIAL = 2
+  -- Max updates that will be skipped in a row
+  local MAX_THROTTLED = 4
+
+  -- SLOW: If (line) is the same, only every fifth update
   -- NORMAL: If (line) is different, only every second update
-  -- Exception: If (line) is different following a SLOW period, do not skip that line
+  -- Exception: If (line) is different during a SLOW period, do not skip that line
   -- In:  A B C D E E E E F G H
   -- Out: A   C   E     E F   H
-  if skippedUpdates >= 2 then
-    spareUpdates = 1
-  else
-    if line == lastStateUpdate then
+  if line == lastStateUpdate then
+    if skippedUpdates >= 2 then
+      if spareUpdates < (MAX_SEQUENTIAL-1) then
+        spareUpdates = spareUpdates + 1
+      end
+    end
+    if skippedUpdates < MAX_THROTTLED then
       skippedUpdates = skippedUpdates + 1
       return true
-    else
-      if skippedUpdates == 0 then
-        if spareUpdates == 0 then
-          skippedUpdates = skippedUpdates + 1
-          return true
-        else
-          spareUpdates = 0
-        end
+    end
+  else
+    if skippedUpdates == 0 then
+      if spareUpdates == 0 then
+        skippedUpdates = skippedUpdates + 1
+        return true
+      else
+        spareUpdates = spareUpdates - 1
       end
     end
   end
@@ -362,12 +433,13 @@ local function segStateUpdate(line)
         checkIpUpdate()
         lastIpCheck = time
       end
+      checkAutobackup(time, vals)
     end
 end
 
 local function broadcastAlarm(probeIdx, alarmType, thresh)
-  local curTemp = JSON_TEMPLATE[15+(probeIdx*7)]
-  local pname = JSON_TEMPLATE[13+(probeIdx*7)]
+  local curTemp = JSON_TEMPLATE[15+(probeIdx*11)]
+  local pname = JSON_TEMPLATE[13+(probeIdx*11)]
   
   if alarmType then
     nixio.syslog("warning", "Alarm "..probeIdx..alarmType.." started ringing")
@@ -376,6 +448,8 @@ local function broadcastAlarm(probeIdx, alarmType, thresh)
       cm["al_probe"] = probeIdx
       cm["al_type"] = alarmType
       cm["al_thresh"] = thresh
+      cm["pn"] = cm["pn"..probeIdx]
+      cm["pcurr"] = cm["pcurr"..probeIdx]
       nixio.exece("/usr/share/linkmeter/alarm", {}, cm)
     end
     alarmType = '"'..alarmType..'"'
@@ -383,9 +457,9 @@ local function broadcastAlarm(probeIdx, alarmType, thresh)
     nixio.syslog("warning", "Alarm stopped")
     alarmType = "null"
   end
-  
-  skippedUpdates = 99 -- force the next update    
-  JSON_TEMPLATE[17+(probeIdx*7)] = alarmType
+
+  unthrottleUpdates() -- force the next update
+  JSON_TEMPLATE[22+(probeIdx*11)] = alarmType
   broadcastStatus(function ()
     return ('event: alarm\ndata: {"atype":%s,"p":%d,"pn":"%s","c":%s,"t":%s}\n\n'):format(
       alarmType, probeIdx, pname, curTemp, thresh)
@@ -404,10 +478,12 @@ local function segAlarmLimits(line)
   
     local curr = hmAlarms[i] or {}
     local probeIdx = math.floor(alarmId/2)
+    local alarmType = alarmId % 2
+    JSON_TEMPLATE[18+(probeIdx*11)+(alarmType*2)] = v
     -- Wait until we at least have some config before broadcasting
     if (ringing and not curr.ringing) and (hmConfig and hmConfig.ucid) then
       curr.ringing = os.time()
-      broadcastAlarm(probeIdx, (alarmId % 2 == 0) and "L" or "H", v)
+      broadcastAlarm(probeIdx, (alarmType == 0) and "L" or "H", v)
     elseif not ringing and curr.ringing then
       curr.ringing = nil
       broadcastAlarm(probeIdx, nil, v)
@@ -465,6 +541,11 @@ local function initHmVars()
   rfMap = {}
   rfStatus = {}
   hmAlarms = {}
+  JSON_TEMPLATE = {}
+  for _,v in pairs(JSON_TEMPLATE_SRC) do
+    JSON_TEMPLATE[#JSON_TEMPLATE+1] = v
+  end
+  unthrottleUpdates()
 end
 
 local function lmdStart()
@@ -472,7 +553,10 @@ local function lmdStart()
   local cfg = uci.cursor()
   local SERIAL_DEVICE = cfg:get("lucid", "linkmeter", "serial_device")
   local SERIAL_BAUD = cfg:get("lucid", "linkmeter", "serial_baud")
+  autobackActivePeriod = tonumber(cfg:get("lucid", "linkmeter", "autoback_active")) or 0
+  autobackInactivePeriod = tonumber(cfg:get("lucid", "linkmeter", "autoback_inactive")) or 0
   
+  initHmVars() 
   if os.execute("/bin/stty -F " .. SERIAL_DEVICE .. " raw -echo " .. SERIAL_BAUD) ~= 0 then
     return nil, -2, "Can't set serial baud"
   end
@@ -484,6 +568,7 @@ local function lmdStart()
   serialfd:setblocking(false) 
 
   lastHmUpdate = os.time()
+  lastAutoBackup = lastHmUpdate
   nixio.umask("0022")
   -- Create database
   if not nixio.fs.access(RRD_FILE) then
@@ -497,7 +582,6 @@ local function lmdStart()
     handler = serialHandler
   }
   
-  initHmVars() 
   lucid.register_pollfd(serialPolle)
   
   return true
@@ -518,17 +602,26 @@ local function segLmSet(line)
   if not serialPolle then return "ERR" end
   -- Replace the $LMST,k,v with /set?k=v
   serialPolle.fd:write(line:gsub("^%$LMST,(%w+),(.*)", "\n/set?%1=%2\n"))
+  -- Let the next updates come immediately to make it seem more responsive
+  unthrottleUpdates()
   return "OK"
 end
 
 local function segLmReboot(line)
   if not serialPolle then return "ERR" end
   serialPolle.fd:write("\n/reboot\n")
+  -- Clear our cached config to request it again when reboot is complete
+  initHmVars()
   return "OK"
 end
 
-local function segLmIdentifier(line)
-  return hmConfig and hmConfig.ucid or "Unknown";
+local function segLmGet(line)
+  local vals = segSplit(line)
+  local retVal = {}
+  for i = 1, #vals, 2 do
+    retVal[#retVal+1] = hmConfig and hmConfig[vals[i]] or vals[i+1] or ""
+  end
+  return table.concat(retVal, '\n')
 end
 
 local function segLmRfStatus(line)
@@ -560,7 +653,7 @@ end
 
 local function segLmStateUpdate()
   JSON_TEMPLATE[1] = ""
-  JSON_TEMPLATE[41] = ""
+  JSON_TEMPLATE[#JSON_TEMPLATE] = ""
   -- If the "time" field is still 0, we haven't gotten an update
   if JSON_TEMPLATE[3] == 0 then
     return "{}"
@@ -614,6 +707,26 @@ local function registerStreamingStatus(fn)
   statusListeners[#statusListeners + 1] = fn
 end
 
+local lucid_server
+local lmdStartTime
+local function lmdTick()
+  if os.time() - lmdStartTime > 10 then
+    if serialPolle and not hmConfig then
+      nixio.syslog("warning", "No response from HeaterMeter, running avrupdate")
+      lmdStop()
+      if os.execute("/usr/bin/avrupdate") ~= 0 then
+        nixio.syslog("err", "avrupdate failed")
+      else
+        nixio.syslog("info", "avrupdate OK")
+      end
+      lmdStart()
+    end
+    
+    lucid_server.unregister_tick(lmdTick)
+    lucid_server = nil
+  end
+end
+
 local segmentMap = {
   ["$HMAL"] = segAlarmLimits,
   ["$HMFN"] = segFanParams,
@@ -624,17 +737,18 @@ local segmentMap = {
   ["$HMPD"] = segPidParams,
   ["$HMPN"] = segProbeNames,
   ["$HMPO"] = segProbeOffsets,
+  ["$HMPS"] = segPidInternals,
   ["$HMRF"] = segRfUpdate,
   ["$HMRM"] = segRfMap,
   ["$HMSU"] = segStateUpdate,
   ["$UCID"] = segUcIdentifier,
-  
+
+  ["$LMGT"] = segLmGet,
   ["$LMST"] = segLmSet,
   ["$LMSU"] = segLmStateUpdate,
   ["$LMRB"] = segLmReboot,
   ["$LMRF"] = segLmRfStatus,
   ["$LMDC"] = segLmDaemonControl,
-  ["$LMID"] = segLmIdentifier,
   ["$LMCF"] = segLmConfig,
   ["$LMUP"] = segLmUnknownProbe
   -- $LMSS
@@ -676,6 +790,10 @@ function prepare_daemon(config, server)
       end
     end
   }) 
+
+  lucid_server = server  
+  lmdStartTime = os.time()
+  server.register_tick(lmdTick)
   
   return lmdStart()
 end

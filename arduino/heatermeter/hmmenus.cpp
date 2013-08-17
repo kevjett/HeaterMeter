@@ -5,30 +5,18 @@
 
 static state_t menuHome(button_t button);
 static state_t menuSetpoint(button_t button);
-//static state_t menuProbename(button_t button);
+static state_t menuProbename(button_t button);
 static state_t menuProbeOffset(button_t button);
-static state_t menuProbeSubmenu(button_t button);
 static state_t menuLidOpenOff(button_t button);
 static state_t menuLidOpenDur(button_t button);
 static state_t menuManualMode(button_t button);
 static state_t menuResetConfig(button_t button);
 static state_t menuMaxFanSpeed(button_t button);
-static state_t menuProbeAlarmOn(button_t button);
-static state_t menuProbeAlarmVal(button_t button);
 static state_t menuAlarmTriggered(button_t button);
 static state_t menuLcdBacklight(button_t button);
 static state_t menuToast(button_t button);
 
-#ifdef HEATERMETER_NETWORKING
-static state_t menuConnecting(button_t button);
-static state_t menuNetworkInfo(button_t button);
-#endif  /* HEATERMETER_NETWORKING */
-
 static const menu_definition_t MENU_DEFINITIONS[] PROGMEM = {
-#ifdef HEATERMETER_NETWORKING
-  { ST_CONNECTING, menuConnecting, 2 },
-  { ST_NETWORK_INFO, menuNetworkInfo, 10 },
-#endif  /* HEATERMETER_NETWORKING */
   { ST_HOME_FOOD1, menuHome, 5 },
   { ST_HOME_FOOD2, menuHome, 5 },
   { ST_HOME_AMB, menuHome, 5 },
@@ -36,13 +24,6 @@ static const menu_definition_t MENU_DEFINITIONS[] PROGMEM = {
   { ST_HOME_ALARM, menuAlarmTriggered, 0 },
   { ST_SETPOINT, menuSetpoint, 10 },
   { ST_MANUALMODE, menuManualMode, 10 },
-  { ST_PROBESUB0, menuProbeSubmenu, 10 },
-  { ST_PROBESUB1, menuProbeSubmenu, 10 },
-  { ST_PROBESUB2, menuProbeSubmenu, 10 },
-  { ST_PROBESUB3, menuProbeSubmenu, 10 },
-//  { ST_PROBENAME1, menuProbename, 10 },
-//  { ST_PROBENAME2, menuProbename, 10 },
-//  { ST_PROBENAME3, menuProbename, 10 },
   { ST_PROBEOFF0, menuProbeOffset, 10 },
   { ST_PROBEOFF1, menuProbeOffset, 10 },
   { ST_PROBEOFF2, menuProbeOffset, 10 },
@@ -52,16 +33,11 @@ static const menu_definition_t MENU_DEFINITIONS[] PROGMEM = {
   { ST_RESETCONFIG, menuResetConfig, 10 },
   { ST_MAXFANSPEED, menuMaxFanSpeed, 10 },
   { ST_LCDBACKLIGHT, menuLcdBacklight, 10},
-  { ST_PALARM1_H_ON, menuProbeAlarmOn, 10 },
-  { ST_PALARM1_H_VAL, menuProbeAlarmVal, 10 },
   { ST_TOAST, menuToast, 20 },
   { 0, 0 },
 };
 
 const menu_transition_t MENU_TRANSITIONS[] PROGMEM = {
-#ifdef HEATERMETER_NETWORKING
-  { ST_CONNECTING, BUTTON_TIMEOUT, ST_HOME_FOOD1 },
-#endif  /* HEATERMETER_NETWORKING */
   { ST_HOME_FOOD1, BUTTON_DOWN | BUTTON_TIMEOUT, ST_HOME_FOOD2 },
   { ST_HOME_FOOD1, BUTTON_RIGHT,   ST_SETPOINT },
   { ST_HOME_FOOD1, BUTTON_UP,      ST_HOME_AMB },
@@ -100,7 +76,7 @@ const menu_transition_t MENU_TRANSITIONS[] PROGMEM = {
   { ST_PROBEOFF3, BUTTON_RIGHT, ST_LIDOPEN_OFF },
   
   /* Probe 1 Submenu */
-#if defined(NEVER)  // disabled temporarily
+#if 0
   { ST_PROBESUB1, BUTTON_LEFT | BUTTON_TIMEOUT, ST_HOME_FOOD1 },
   { ST_PROBESUB1, BUTTON_RIGHT, ST_PROBESUB2 },
   { ST_PROBESUB1, BUTTON_DOWN | BUTTON_UP, ST_PROBEOFF1 },
@@ -122,28 +98,13 @@ const menu_transition_t MENU_TRANSITIONS[] PROGMEM = {
   { ST_LIDOPEN_OFF, BUTTON_RIGHT, ST_LIDOPEN_DUR },
 
   { ST_LIDOPEN_DUR, BUTTON_LEFT | BUTTON_TIMEOUT, ST_HOME_FOOD1 },
-#ifdef HEATERMETER_NETWORKING
-  { ST_LIDOPEN_DUR, BUTTON_RIGHT, ST_NETWORK_INFO },
-
-  { ST_NETWORK_INFO, BUTTON_LEFT | BUTTON_TIMEOUT, ST_HOME_FOOD1 },
-  { ST_NETWORK_INFO, BUTTON_RIGHT, ST_RESETCONFIG },
-#else
-   { ST_LIDOPEN_DUR, BUTTON_RIGHT, ST_RESETCONFIG },
-#endif  /* HEATERMETER_NETWORKING */
+  { ST_LIDOPEN_DUR, BUTTON_RIGHT, ST_RESETCONFIG },
 
   { ST_RESETCONFIG, BUTTON_LEFT | BUTTON_TIMEOUT, ST_HOME_FOOD1 },
   { ST_RESETCONFIG, BUTTON_RIGHT, ST_SETPOINT },
 
   { 0, 0, 0 },
 };
-
-#ifdef HEATERMETER_NETWORKING
-extern "C" {
-#include "witypes.h"
-#include "g2100.h"
-extern char ssid[];
-}
-#endif /* HEATERMETER_NETWORKING */
 
 // scratch space for edits
 int editInt;
@@ -170,7 +131,7 @@ static button_t readButton(void)
   return BUTTON_NONE;
 }
 
-static void menuBooleanEdit(button_t button, const prog_char *preamble)
+static void menuBooleanEdit(button_t button, const char PROGMEM *preamble)
 {
   if (button == BUTTON_UP || button == BUTTON_DOWN)
     editInt = !editInt;
@@ -182,7 +143,7 @@ static void menuBooleanEdit(button_t button, const prog_char *preamble)
 }
 
 static void menuNumberEdit(button_t button, unsigned char increment,
-  int minVal, int maxVal, const prog_char *format)
+  int minVal, int maxVal, const char PROGMEM *format)
 {
   char buffer[17];
   
@@ -215,7 +176,6 @@ static void menuNumberEdit(button_t button, unsigned char increment,
     (State) - If the edit is completed and the caller should commit the new value
               the current Menu State is returned. The menu will return to read-only state
 */            
-/*
 static state_t menuStringEdit(button_t button, const char *line1, unsigned char maxLength)
 {
   static unsigned char editPos = 0;
@@ -255,7 +215,7 @@ static state_t menuStringEdit(button_t button, const char *line1, unsigned char 
     {
       editPos = 0;
       lcd.noBlink();
-      return Menus.State;
+      return Menus.getState();
     }
   }
 
@@ -283,7 +243,6 @@ static state_t menuStringEdit(button_t button, const char *line1, unsigned char 
   
   return ST_AUTO;
 }
-*/
 
 static void menuProbenameLine(unsigned char probeIndex)
 {
@@ -308,7 +267,7 @@ static state_t menuHome(button_t button)
     updateDisplay();
   }
   // In manual fan mode Up is +5% Down is -5% and Left is -1%
-  else if (pid.getManualFanMode())
+  else if (pid.getManualOutputMode())
   {
     char offset;
     if (button == BUTTON_UP)
@@ -320,7 +279,7 @@ static state_t menuHome(button_t button)
     else
       return ST_AUTO;
 
-    pid.setFanSpeed(pid.getFanSpeed() + offset);
+    pid.setPidOutput(pid.getPidOutput() + offset);
     updateDisplay();
     return ST_NONE;
   }
@@ -332,30 +291,6 @@ static state_t menuHome(button_t button)
   }
   return ST_AUTO;
 }
-
-#ifdef HEATERMETER_NETWORKING
-static state_t menuConnecting(button_t button)
-{
-  lcdprint_P(PSTR("Connecting to"), true);
-  lcd.setCursor(0, 1);
-  lcd.print(ssid);
-
-  return ST_AUTO;
-}
-
-static state_t menuNetworkInfo(button_t button)
-{
-  if (button == BUTTON_ENTER || button == BUTTON_UP || button == BUTTON_DOWN)
-  {
-    char buffer[17];
-    lcdprint_P(PSTR("Wireless Signal"), true);
-    lcd.setCursor(0, 1);
-    snprintf_P(buffer, sizeof(buffer), PSTR("%3u%% %s"), zg_get_rssi() - 100, ssid);
-    lcd.print(buffer);
-  }
-  return ST_AUTO;
-}
-#endif /* HEATERMETER_NETWORKING */
 
 static state_t menuSetpoint(button_t button)
 {
@@ -376,11 +311,10 @@ static state_t menuSetpoint(button_t button)
   return ST_AUTO;
 }
 
-/*
 static state_t menuProbename(button_t button)
 {
   char buffer[17];
-  unsigned char probeIndex = Menus.State - ST_PROBENAME1 + 1;
+  unsigned char probeIndex = Menus.getState() - ST_PROBENAME1 + 1;
 
   if (button == BUTTON_ENTER)
   {
@@ -391,12 +325,11 @@ static state_t menuProbename(button_t button)
   // note that we only load the buffer with text on the ENTER call,
   // after that it is OK to have garbage in it  
   state_t retVal = menuStringEdit(button, buffer, PROBE_NAME_SIZE - 1);
-  if (retVal == Menus.State)
-    storeProbeName(probeIndex, editString);
+  if (retVal == Menus.getState())
+    storeAndReportProbeName(probeIndex, editString);
     
   return retVal;
 }
-*/
 
 static state_t menuProbeOffset(button_t button)
 {
@@ -411,19 +344,6 @@ static state_t menuProbeOffset(button_t button)
     storeAndReportProbeOffset(probeIndex, editInt);
 
   menuNumberEdit(button, 1, -100, 100, PSTR("Offset %4d"DEGREE"%c"));
-  return ST_AUTO;
-}
-
-static state_t menuProbeSubmenu(button_t button)
-{
-  unsigned char probeIndex = Menus.getState() - ST_PROBESUB0;
-  if (button == BUTTON_ENTER)
-  {
-    menuProbenameLine(probeIndex);
-    lcd.setCursor(0, 1);  
-    lcdprint_P(PSTR("v probe config v"), false);
-  }
-  
   return ST_AUTO;
 }
 
@@ -464,14 +384,14 @@ static state_t menuManualMode(button_t button)
   if (button == BUTTON_ENTER)
   {
     lcdprint_P(PSTR("Manual fan mode"), true);
-    editInt = pid.getManualFanMode();    
+    editInt = pid.getManualOutputMode();
   }
   else if (button == BUTTON_LEAVE)
   {
     // Check to see if it is different because the setPoint 
     // field stores either the setPoint or manual mode
     boolean manual = (editInt != 0); 
-    if (manual != pid.getManualFanMode())
+    if (manual != pid.getManualOutputMode())
       storeSetPoint(manual ? 0 : pid.getSetPoint());
   }
   menuBooleanEdit(button, NULL);
@@ -488,7 +408,7 @@ static state_t menuResetConfig(button_t button)
   else if (button == BUTTON_LEAVE)
   {
     if (editInt != 0)
-      eepromLoadConfig(true);
+      eepromLoadConfig(1);
   }
   menuBooleanEdit(button, NULL);
   return ST_AUTO;
@@ -511,64 +431,40 @@ static state_t menuMaxFanSpeed(button_t button)
   return ST_AUTO;
 }
 
-static state_t menuProbeAlarmOn(button_t button)
-{
-  // This function works for both low and high so determine which we're being called for
-  unsigned char highOrLow;
-  if (Menus.getState() >= ST_PALARM0_H_ON && Menus.getState() <= ST_PALARM3_H_ON)
-    highOrLow = ST_PALARM0_H_ON;
-  else
-    highOrLow = ST_PALARM0_L_ON;
-    
-  unsigned char probeIndex = Menus.getState() - highOrLow;
-  if (button == BUTTON_ENTER)
-  {
-    menuProbenameLine(probeIndex);
-    editInt = pid.Probes[probeIndex]->Alarms.Thresholds[ST_PALARM0_H_ON - highOrLow] > 0;
-  }
-  else if (button == BUTTON_LEAVE)
-  {
-//    boolean val = (editInt != 0);
-//    if 
-  }
-
-  menuBooleanEdit(button, (highOrLow == ST_PALARM0_H_ON) ? PSTR("High alarm? ") : PSTR("Low alarm? "));
-  return ST_AUTO;
-}
-
-static state_t menuProbeAlarmVal(button_t button)
-{
-  // This function works for both low and high so determine which we're being called for
-  unsigned char highOrLow;
-  if (Menus.getState() >= ST_PALARM0_H_VAL && Menus.getState() <= ST_PALARM3_H_VAL)
-    highOrLow = ST_PALARM0_H_VAL;
-  else
-    highOrLow = ST_PALARM0_L_VAL;
-    
-  unsigned char probeIndex = Menus.getState() - highOrLow;
-  if (button == BUTTON_ENTER)
-  {
-    menuProbenameLine(probeIndex);
-    editInt = pid.Probes[probeIndex]->Alarms.Thresholds[ST_PALARM0_H_VAL - highOrLow] ;
-  }
-  
-  menuNumberEdit(button, 5, 0, 1000, 
-    (highOrLow == ST_PALARM0_H_VAL) ? PSTR("High Alrm %4d"DEGREE"%c") : PSTR("Low Alrm %5d"DEGREE"%c"));
-  return ST_AUTO;
-}
-
 static state_t menuAlarmTriggered(button_t button)
 {
   if (button == BUTTON_ENTER)
-  {
     updateDisplay();
-  }
-  // If any physical button is pressed, clear the alarm state and return to HOME
+  // If any physical button is pressed, silence and return home
   else if (button & BUTTON_ANY)
   {
-    disableRingingAlarm();
+    silenceRingingAlarm();
     return ST_HOME_FOOD1;
   }
+
+  return ST_AUTO;
+}
+
+static state_t menuAlarmAction(button_t button)
+{
+  if (button == BUTTON_ENTER)
+  {
+    lcdprint_P(PSTR("Alarm"), true);
+    editInt = 0;
+  }
+  else if (button == BUTTON_TIMEOUT)
+    return ST_HOME_ALARM;
+  else if (button == BUTTON_LEFT || button == BUTTON_RIGHT)
+  {
+    /* False is 'silence', true is 'disable' */
+    silenceRingingAlarm(); //editInt);
+    return ST_HOME_FOOD1;
+  }
+  else if (button == BUTTON_UP || button == BUTTON_DOWN)
+    editInt = !editInt;
+
+  lcd.setCursor(0, 1);
+  lcdprint_P((editInt != 0) ? PSTR("^ Disable v") : PSTR("^ Silence v"), false);
 
   return ST_AUTO;
 }
@@ -605,7 +501,7 @@ static state_t menuToast(button_t button)
     return ST_AUTO;
   }
   // Timeout or button press returns you to the previous menu
-  return Menus.getSavedState();
+  return Menus.getLastState();
 }
 
 void HmMenuSystem::displayToast(char *msg)
@@ -625,10 +521,9 @@ void HmMenuSystem::displayToast(char *msg)
     memcpy(getToastLine1(), pos+1, min(strlen(pos)-1, sizeof(_toastMsg)/2));
   }
   if (getState() != ST_TOAST)
-    _savedState = getState();
+    setState(ST_TOAST);
   else
-    setState(ST_NONE); // If already in a toast force a refresh
-  setState(ST_TOAST);
+    menuToast(BUTTON_ENTER); // If already in a toast force a refresh
 }
 
 HmMenuSystem Menus(MENU_DEFINITIONS, MENU_TRANSITIONS, &readButton);

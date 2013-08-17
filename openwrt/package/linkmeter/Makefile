@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=linkmeter
-PKG_RELEASE:=2
+PKG_RELEASE:=9
 
 PKG_BUILD_PARALLEL:=1
 
@@ -57,14 +57,17 @@ define Package/linkmeter/install
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/controller/linkmeter/* $(1)/usr/lib/lua/luci/controller/linkmeter/
 	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/view/linkmeter
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/view/linkmeter/* $(1)/usr/lib/lua/luci/view/linkmeter/
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/model/cbi/linkmeter
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/model/cbi/linkmeter/* $(1)/usr/lib/lua/luci/model/cbi/linkmeter/
 endef
 
 define Package/linkmeter/postinst
 #!/bin/sh
 	[ -n "$${IPKG_INSTROOT}" ] && exit
-	/etc/uci-defaults/linkmeter
+	/etc/uci-defaults/linkmeter update
 	rm /etc/uci-defaults/linkmeter
 	rm -f /tmp/luci-indexcache
+	rm -f /tmp/luci-modulecache/*
 	/etc/init.d/lucid restart
 endef
 
@@ -74,10 +77,11 @@ define Package/linkmeter/postrm
 	[ -n "$${IPKG_INSTROOT}" ] && exit
 
 	/etc/init.d/lucid stop
-	if [ -f "/tmp/hm.rrd" ] ; then rm "/tmp/hm.rrd" ; fi
+	[ -f "/tmp/hm.rrd" ] && rm "/tmp/hm.rrd"
 	uci del lucid.lmserver
 	uci commit lucid
 	rm -f /tmp/luci-indexcache
+	rm -f /tmp/luci-modulecache/*
 	/etc/init.d/lucid start
 endef
 

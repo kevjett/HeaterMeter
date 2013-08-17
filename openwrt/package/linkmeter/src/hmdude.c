@@ -48,8 +48,8 @@ static int ihex_len;
 static int spi_intialized;
 
 static bool do_chiperase;
-static bool do_disable_autoerace;
-static bool do_dumpprogmem;
+static bool do_disable_autoerase;
+static bool do_dumpmemory;
 static bool do_verify = true;
 
 #define msleep(x) usleep(x * 1000)
@@ -541,6 +541,22 @@ static void spi_dump_progmem(void)
   }
 }
 
+static void spi_dump_eeprom(void)
+{
+  uint16_t addr;
+  for (addr=0; addr<1024; ++addr)
+  {
+    uint8_t msb = (addr >> 8) & 0xff;
+    uint8_t lsb = addr & 0xff;
+
+    if (addr % 16 == 0)
+      fprintf(stdout, "%04x:", addr);
+    fprintf(stdout, "%02x ", spi_transaction(0xa0, msb, lsb, 0, 3));
+    if (addr % 16 == 15)
+      fprintf(stdout, "\n");
+  }
+}
+
 static int spi_upload_file(void)
 {
   int rc = 0;
@@ -559,8 +575,8 @@ static int spi_upload_file(void)
   }
 
   if (baud == 0)
-    baud = 2048;
-  baud *= 1024;
+    baud = 2000;
+  baud *= 1000;
 
   if ((rc = ioctl(port_fd, SPI_IOC_WR_MODE, &mode)) == -1)
   {
@@ -596,7 +612,7 @@ static int spi_upload_file(void)
   // during a flash operation, so you can flash without erasing if your
   // chip is already full of 0xff
   if (do_chiperase || 
-    (file_ihex != NULL && do_disable_autoerace == false))
+    (file_ihex != NULL && do_disable_autoerase == false))
   { 
     if ((rc = spi_chiperase()) != 0)
       goto cleanup;
@@ -613,8 +629,13 @@ static int spi_upload_file(void)
     if (do_fuse[fuse])
       spi_write_fuse(fuse, write_fuse[fuse]);
   
-  if (do_dumpprogmem)
+  if (do_dumpmemory)
+  {
+    fprintf(stdout, "PROGMEM\n");
     spi_dump_progmem();
+    fprintf(stdout, "\nEEPROM\n");
+    spi_dump_eeprom();
+  }
 
 cleanup:  
   if (port_fd >= 0)
@@ -688,6 +709,27 @@ static void parse_uflag(char *arg)
   set_file_ihex(arg);
 }
 
+static int config_fuses_invalid(void)
+{
+  /* Just some sanity checks to make sure I don't set anything that
+     will require a high voltage programmer to fix */
+  int rc = 0;
+  if (do_fuse[FUSE_HIGH])
+  {
+    if ((write_fuse[FUSE_HIGH] & 0x80) == 0)
+    {
+      fprintf(stderr, "FUSE: Will not RSTDISBL\n");
+      rc = -1;
+    }
+    if ((write_fuse[FUSE_HIGH] & 0x20) != 0)
+    {
+      fprintf(stderr, "FUSE: Will not disable SPIEN\n");
+      rc = -1;
+    }
+  }
+  return rc;
+}
+
 int main(int argc, char *argv[])
 {
   int rc;
@@ -706,7 +748,7 @@ int main(int argc, char *argv[])
         baud = atol(optarg);
         break;
       case 'd':
-        do_dumpprogmem = true;
+        do_dumpmemory = true;
         break;
       case 'e':
         do_chiperase = true;
@@ -715,7 +757,7 @@ int main(int argc, char *argv[])
         ++verbose;
         break;
       case 'D':
-        do_disable_autoerace = true;
+        do_disable_autoerase = true;
         break;
       case 'P':
         set_port(optarg);
@@ -731,6 +773,9 @@ int main(int argc, char *argv[])
         break;
     }
   } /* while getopt */
+ 
+  if (config_fuses_invalid())
+    return -1; 
 
   fprintf(stdout, "Using port: %s\n", port);
   load_ihex();
