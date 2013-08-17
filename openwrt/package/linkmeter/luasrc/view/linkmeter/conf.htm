@@ -1,6 +1,6 @@
 <% require "lmclient" %>
 <%+header%>
-<script language="javascript" src="<%=resource%>/js/jquery.min.js" type="text/javascript"></script>
+<script language="javascript" src="<%=resource%>/js/jquery-1.9.1.min.js" type="text/javascript"></script>
 <script type="text/javascript">//<![CDATA[
 var configHash = <%= LmClient():query("$LMCF") or "{}" %>;
 var rfInterval;
@@ -99,6 +99,9 @@ function typeChanged()
   var name = this.id.substr(2);
   $("#pbody" + name).css("display", (this.value == 0) ? "none" : "block");
   $("#prf" + name).css("display", (this.value == 2) ? "block" : "none");
+  // If switching to 'RF' and no node number is filled in, default to 'any'
+  if (this.value == 2 && $("#prfn" + name).val() == "")
+    $("#prfa" + name).prop("checked", true).trigger("change");
 }
 
 function isProbeId(hay, need)
@@ -115,7 +118,7 @@ function configHashToForm()
     if (elem == null)
       continue;
     var val = configHash[k];
-      
+
     if (isProbeId(k, "pcurr"))
     {
       if (val != null)
@@ -137,13 +140,28 @@ function configHashToForm()
     else if (isProbeId(k, "prfn"))
       $("#prfa" + k.substr(4))
         .change(configElemChange)
-        .attr("checked", val == 127);
+        .prop("checked", val == 127);
     else if (isProbeId(k, "pall") || isProbeId(k, "palh"))
       $("#pale" + k.substr(3))
         .change(configElemChange)
-        .attr("checked", val > 0);
-    else if (k == "finv")
-      elem.attr("checked", val != 0);
+        .prop("checked", val > 0);
+    else if (isProbeId(k, "le"))
+    {
+      if (val == 255) val = 127;
+      $("#les" + k.substr(2))
+        .change(configElemChange)
+        .val(val & 0x7f);
+      $("#lei" + k.substr(2))
+        .change(configElemChange)
+        .prop("checked", val & 0x80);
+    }
+    else if (k == "oflag")
+      setupCheckboxBitmask(k, val);
+    else if (k == "smin" || k == "smax")
+      $("#" + k + "X")
+        .val(val * 10)
+        .change(configElemChange);
+
     elem.change(configElemChange);
   }
 }
@@ -177,7 +195,7 @@ function configElemChange()
   else if (isProbeId(name, "prfn"))
   {
     name = "#prfa" + name.substr(4);
-    $(name).attr("checked", $(this).val() == "127");
+    $(name).prop("checked", $(this).val() == "127");
   }
   else if (isProbeId(name, "palel") || isProbeId(name, "paleh"))
   {
@@ -192,9 +210,44 @@ function configElemChange()
   else if (isProbeId(name, "pall") || isProbeId(name, "palh"))
   {
     name = "#pale" + name.substr(3);
-    $(name).attr("checked", $(this).val() > 0);
+    $(name).prop("checked", $(this).val() > 0);
   }
+  else if (isProbeId(name, "les") || isProbeId(name, "lei"))
+  {
+    var target = "#le" + name.substr(3);
+    var val = $("#les" + name.substr(3)).val();
+    if ($("#lei" + name.substr(3)).is(":checked"))
+      val |= 0x80;
+    $(target).val(val);
+  }
+  else if (isProbeId(name, "oflag"))
+  {
+    var idx = +name.substr(5);
+    var val = $("#oflag").val();
+    if ($(this).is(":checked"))
+      val |= (1 << idx);
+    else
+      val &= ~(1 << idx);
+    $("#oflag").val(val);
+  }
+  else if (name == "sminX" || name == "smaxX")
+    $("#" + name.substr(0, 4))
+      .val(Math.round($(this).val() / 10));
+
   updateUpdateUrl();
+}
+
+function setupCheckboxBitmask(k, v)
+{
+  for (i=0; i<8; ++i)
+  {
+    var elem = $("#" + k + i)
+    if (elem)
+    {
+      elem.change(configElemChange)
+        .prop("checked", v & (1 << i));
+    }
+  }
 }
 
 function configToForm()
@@ -232,8 +285,6 @@ function configChangedHash()
     var val = elem.val();
     if (isProbeId(k, "prfn") && val == "")
       val = null;
-    else if (k == "finv")
-      val = elem.is(":checked") ? 1 : 0;
     if (val != configHash[k])
       r[k] = val;
   }
@@ -295,12 +346,12 @@ function updateConfigUrl(divname, h)
       aValues.push(k + "=" + encodeURIComponent(h[k]));
   }
   
-  csvItems(h, aValues, "lb", ["lb", "lbn"]);
+  csvItems(h, aValues, "lb", ["lb", "lbn", "le0", "le1", "le2"]);
   csvItems(h, aValues, "ld", ["lo", "ld"]);
   csvItems(h, aValues, "po", ["po0", "po1", "po2", "po3"]);
-  csvItems(h, aValues, "fn", ["fmin", "fmax", "finv"]);
   csvItems(h, aValues, "al", ["pall0", "palh0", "pall1", "palh1",
     "pall2", "palh2", "pall3", "palh3"]);
+  csvItems(h, aValues, "fn", ["fmin", "fmax", "smin", "smax", "oflag"]);
   for (var i=0; i<4; ++i)
     csvItems(h, aValues, "pc"+i, ["pca"+i, "pcb"+i, "pcc"+i, "pcr"+i, 
       function () { return getProbeTypeForSend(h, i); } ]);
@@ -313,7 +364,7 @@ function updateConfigUrl(divname, h)
     var url = '<%=build_url("admin/lm/set")%>?' + aValues.join("&amp;");
     if (divname == "#updateurl")
     {
-      $("input:button[name=cbi.apply]").click(
+      $(':button[name="cbi.apply"]').click(
         (function (urlval) {
           return function () { return ifrmTarget(urlval); }
         })(url)
@@ -324,7 +375,11 @@ function updateConfigUrl(divname, h)
     elem.html(s);
   }
   else
+  {
     elem.html("none");
+    if (divname == "#updateurl")
+      $(':button[name="cbi.apply"]').off("click");
+  }
 }
 
 function coeffClick(probeId, idx)
@@ -396,7 +451,7 @@ function ifrmHide()
   .pconfig { vertical-align: top; width: 25%; }
   .ptitle { padding: 4px; text-align: center; font-size: large; }
   .pcurr { text-align: center; color: #ccc; font-size: small; }
-  td.pconfig label { width: 4em; float: left; }
+  td.pconfig label { width: 4em; display: inline-block; }
   .pnum0 { background: #e73; }
   .pnum1 { background: #6c3; }
   .pnum2 { background: #297; }
@@ -404,16 +459,22 @@ function ifrmHide()
   .pcpreset { font-size: x-small; text-align: center; position: relative; }
   .rfstatus { float: left; width: 16px; height: 16px; 
     background-image: url('<%=resource%>/rf.png'); }
+  div.cbi-value-last { border-bottom: none; }
   a.nodest { text-decoration: none; }
   ul#rfnodes { list-style-type: none; margin-left: 0 !important; }
   ul#rfnodes li { float: left; border: 1px dotted #bbb;
     margin-right: 1em; padding-right: 0.5em; }
+  ul.led { list-style-type: none; margin-left: 0 !important; }
+  ul.led li { display: inline-block; margin-right: 10px; position: relative; }
+  ul.led label { position: absolute; right: 0; }
+  div.circle { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    border: 1px solid gray; }
   #pcppopup { position: absolute; left: 0px; top: 0px; width: 100%; background: #f5f5f5; border: 2px solid #333; font-size: x-small; display: none; text-align: left; }
   #dialog-overlay { width: 100%; height: 100%; position: fixed; 
     top: 0px; left: 0px; display: none; background-color: #000; 
     opacity: 0.6; z-index: 1; }
   #dialog-container { background-color: #f5f5f5; width: 480px; height: 200px;
-    border: 5px solid #4A6B7C; padding: 10px; 
+    border: 4px solid #4A6B7C; padding: 10px; border-radius: 10px;
     position: fixed; z-index: 2; top: 100px; display: none;
     left: 50%; margin-left: -240px; }
 </style>
@@ -441,8 +502,7 @@ You can store a configuration by bookmarking the "Full configuration" link.</p>
 <div class="ptitle pnum<%=i%>">Probe <%=i%></div>
 <div class="pcurr" id="pcurr<%=i%>"></div>
 <div class="cbi-value"><label>Name</label><input type="text" maxlength="12" class="pn" id="pn<%=i%>"/></div>
-<div class="cbi-value"><label>Type</label>
-<select class="pt" id="pt<%=i%>">
+<div class="cbi-value"><label>Type</label><select class="pt" id="pt<%=i%>">
   <option value="0">Disabled</option>
   <option value="1">Internal</option>
   <option value="2">RF12 Wireless</option>
@@ -459,19 +519,19 @@ You can store a configuration by bookmarking the "Full configuration" link.</p>
   <div class="cbi-value">
     <label>Low</label>
     <input type="text" maxlength="4" id="pall<%=i%>" style="width: 3em;"/>
-    <input type="checkbox" id="palel<%=i%>" class="pale"> On</input>
+    <label><input type="checkbox" id="palel<%=i%>" class="pale"/> On</label>
   </div>
   <div class="cbi-value">
     <label>High</label>
     <input type="text" maxlength="4" id="palh<%=i%>" style="width: 3em;"/>
-    <input type="checkbox" id="paleh<%=i%>" class="pale"> On</input>
+    <label><input type="checkbox" id="paleh<%=i%>" class="pale"/> On</label>
   </div>
 </div>
 <div id="prf<%=i%>" style="display: none;">
   <div><b>RF12 Configuration</b></div>
-  <div class="cbi-value"><label>Node</label>
+  <div class="cbi-value cbi-value-last"><label>Node</label>
     <input type="text" maxlength="3" id="prfn<%=i%>" style="width: 2em;"/>
-    <input type="checkbox" id="prfa<%=i%>" class="prfa"> Any</input>
+    <label><input type="checkbox" id="prfa<%=i%>" class="prfa"/> Any</label>
   </div>
 </div>
 </td>
@@ -484,13 +544,13 @@ You can store a configuration by bookmarking the "Full configuration" link.</p>
 <div class="cbi-section-descr">Visible lmremote and La Crosse IT+ RF transmitters
 available for use as probe sensors. Set the probe type to "RF12 Wireless" an
 enter the node number shown below in the Node field. IT+ transmitters get new IDs each
-time they are restared.</div>
+time they are restarted.</div>
 <ul id="rfnodes">
 </ul>
 </fieldset>
 
 <fieldset class="cbi-section" id="cbi-lm-pid">
-<legend>PID Tuning Parameters</legend>
+<legend>PID Output Parameters</legend>
   <div class="cbi-value">
     Bias <input type="text" maxlength="12" id="pidb" style="width: 5em;"/>
     Proportional <input type="text" maxlength="12" id="pidp" style="width: 5em;"/>
@@ -498,22 +558,69 @@ time they are restared.</div>
     Derivative <input type="text" maxlength="12" id="pidd" style="width: 5em;"/>
   </div>
   <div class="cbi-value">
-    Fan speed min <input type="text" maxlength="3" id="fmin" style="width: 2em;"/>%
-    max <input type="text" maxlength="3" id="fmax" style="width: 2em;"/>%
-    <input type="checkbox" id="finv"/><label for="finv"> Invert output</label>
+    <input type="hidden" id="oflag"/>
+    Fan speed
+    min <input type="text" maxlength="3" id="fmin" style="width: 2em;"/>% max
+      <input type="text" maxlength="3" id="fmax" style="width: 2em;"/>%
+    <label><input type="checkbox" id="oflag0"/> Invert output</label>
+    <label><input type="checkbox" id="oflag2"/> On at max only</label>
+    </ul>
+  </div>
+  <div class="cbi-value cbi-value-last">
+    Servo pulse duration
+    <input type="hidden" id="smin"/>
+      <input type="text" maxlength="4" id="sminX" style="width: 3em;"/>us -
+    <input type="hidden" id="smax"/>
+      <input type="text" maxlength="4" id="smaxX" style="width: 3em;"/>us
+    <label><input type="checkbox" id="oflag1"/> Invert output</label>
+    <label><input type="checkbox" id="oflag3"/> Full open/close only</label>
   </div>
 </fieldset>
 
 <fieldset class="cbi-section" id="cbi-lm-lcd">
-<legend>LCD Display</legend>
-  Backlight <input type="text" maxlength="3" id="lb" style="width: 2em;"/>%
-  <select id="lbn" style="width: 13em;">
-    <option value="255">2-line Home</option>
-    <option value="0">Large Home: Probe 0</option>
-    <option value="1">Large Home: Probe 1</option>
-    <option value="2">Large Home: Probe 2</option>
-    <option value="3">Large Home: Probe 3</option>
-  </select>
+<legend>LCD / LED Display</legend>
+  <div class="cbi-value">
+    Backlight <input type="text" maxlength="3" id="lb" style="width: 2em;"/>%
+    <select id="lbn" style="width: 12em;">
+      <option value="255">2-line Home</option>
+      <option value="254">4-line Home</option>
+      <option value="0">Large Home: Probe 0</option>
+      <option value="1">Large Home: Probe 1</option>
+      <option value="2">Large Home: Probe 2</option>
+      <option value="3">Large Home: Probe 3</option>
+    </select>
+  </div>
+  <div class="cbi-value cbi-value-last">
+  <ul class="led">
+<% for i=0,2 do 
+    local clr = (i == 0) and "red" or (i == 1) and "gold" or "greenyellow" %>
+    <li><div class="circle" style="background: <%=clr%>"></div>
+    LED <%=i+1%>
+    <label>Invert <input type="checkbox" id="lei<%=i%>"/></label>
+    <br/>
+    <input type="hidden" id="le<%=i%>"/>
+    <select id="les<%=i%>" style="width: 11em;">
+      <option value="0">Off</option>
+      <option value="1">Alarm 0 Low</option>
+      <option value="2">Alarm 0 High</option>
+      <option value="3">Alarm 1 Low</option>
+      <option value="4">Alarm 1 High</option>
+      <option value="5">Alarm 2 Low</option>
+      <option value="6">Alarm 2 High</option>
+      <option value="7">Alarm 3 Low</option>
+      <option value="8">Alarm 3 High</option>
+      <option value="14">Any Alarm Ringing</option>
+      <option value="9">RF Data Received</option>
+      <option value="10">Lid Open</option>
+      <option value="11">Fan speed > 0%</option>
+      <option value="13">Fan speed = Max</option>
+      <option value="12">Pit Temp Reached</option>
+      <option value="127">Unset</option>
+    </select>
+    </li>
+<% end %>
+  </ul>
+  </div>
 </fieldset>
 
 <fieldset class="cbi-section" id="cbi-lm-lid">

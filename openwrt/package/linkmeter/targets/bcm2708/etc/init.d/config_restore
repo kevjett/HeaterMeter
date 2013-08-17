@@ -1,0 +1,104 @@
+#!/bin/sh /etc/rc.common
+
+START=90
+start () {
+
+PARTED=`which parted`
+if [ -z "$PARTED" ] ; then
+  echo parted utility not found
+  exit 1
+fi
+
+DEV="/dev/mmcblk0"
+RESTORE=0
+IS_DEFAULT=0
+PARTED="$PARTED -m -s $DEV unit s"
+SECTORS=`$PARTED p | grep ^${DEV} | cut -d':' -f 2 | cut -d's' -f 1`
+
+# Make sure we've got at least 64MB of storage
+[ -z "$SECTORS" ] || [ "$SECTORS" -lt 131072 ] && exit 1
+
+# If there's not already a partition 4, create one
+if ! $PARTED p 4 > /dev/null 2>&1 ; then
+  P3CREATED=0
+  IS_DEFAULT=1
+  echo No partition 4 found on $SECTORS sector device
+  
+  # If any other partition extends to the end of the device, forget it
+  $PARTED p | grep -v ${DEV} | grep :$((SECTORS-1))s: && exit 0
+  
+  echo No partition reaches end of device
+  if ! $PARTED p 3 > /dev/null 2>&1 ; then
+    echo No partition 3 found
+    
+    P2END=`$PARTED p | grep "^2:" | cut -d':' -f 3 | cut -d's' -f 1`
+    [ -z "$P2END" ] && exit 1
+    
+    echo Creating temporary partition 3: $((P2END+1))s $((SECTORS-131073))s
+    $PARTED mkpart primary ext2 $((P2END+1))s $((SECTORS-131073))s || exit 1
+    P3CREATED=1
+  fi
+  
+  # START 64MB from the end
+  echo Creating partition 4: $((SECTORS-131072))s $((SECTORS-1))s
+  $PARTED mkpart primary ext2 $((SECTORS-131072))s $((SECTORS-1))s
+  RC=$?
+  
+  # Make sure the creation was successful
+  [ $RC -ne 0 ] && exit $RC
+  RESTORE=1
+ 
+  # Remove the temporary partition if we made it 
+  [ $P3CREATED -ne 0 ] && $PARTED rm 3
+fi # if no partition 3
+
+# The device won't show up in /dev for a little while
+CNT=0
+while [ ! -e "${DEV}p4" ] ; do
+  sleep 1
+  CNT=$((CNT+1))
+  if [ $CNT -gt 20 ] ; then
+    echo Backup device not found, aborting
+    exit 1
+  fi
+done
+
+if ! e2fsck -n ${DEV}p4 > /dev/null ; then
+  RESTORE=0
+  echo Formatting filesystem...
+  # fsck failed so go ahead and create a new filesystem
+  mkfs.ext4 -m 0 -O ^resize_inode,^has_journal,extent,uninit_bg ${DEV}p4
+  e2fsck ${DEV}p4
+fi
+
+# Mount the device if not already mounted
+MNT="/mnt/${DEV##/dev/}p4"
+[ -d "$MNT" ] || mkdir -p $MNT
+mount | grep ${DEV}p4 || mount -t ext4 -o rw,sync ${DEV}p4 $MNT
+
+# Mount the boot partition
+[ -d "/boot" ] || mkdir /boot
+mount -t vfat -o rw,sync ${DEV}p1 /boot
+
+# If this is a fresh system, store the default configuration
+if [ $IS_DEFAULT -eq 1 -a -d "$MNT/lost+found" ] ; then
+  sysupgrade -b $MNT/default-config.tar.gz
+fi
+
+if grep -i norestore /proc/cmdline > /dev/null ; then
+  echo "Skipping system backup restore (NORESTORE specified)"
+elif [ $RESTORE -ne 0 ] ; then
+  if [ -f "$MNT/backup.tar.gz" ] ; then
+    echo Restoring system backup...
+    sysupgrade -r $MNT/backup.tar.gz
+    sync
+    reboot
+  fi
+  exit 0
+fi
+
+if [ -d "$MNT/lost+found" ] ; then
+  sysupgrade -b $MNT/backup.tar.gz
+fi
+
+}

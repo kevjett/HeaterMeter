@@ -17,12 +17,12 @@ boolean RFSource::update(rf12_packet_t *pkt)
 
   unsigned char newFlags = 0;
   if ((pkt->byte1 & 0x20) != 0)
-    newFlags |= RecentReset;
+    newFlags |= RFSOURCEFLAG_RecentReset;
   if ((pkt->hygro & 0x80) != 0)
-    newFlags |= LowBattery;
+    newFlags |= RFSOURCEFLAG_LowBattery;
    /* Hygro value of 6A=NoHygro 7D=Secondary Unit?(TX25U) 7F=lmremote */
   if ((pkt->hygro & 0x7f) < 0x7f)
-    newFlags |= NativeItPlus;
+    newFlags |= RFSOURCEFLAG_NativeItPlus;
   _flags = newFlags;
   _rssi = rf12_rssi();
 
@@ -49,7 +49,7 @@ void RFManager::init(unsigned char band)
 {
   if (!_initialized)
   {
-    rf12_initialize(1, band);
+    rf12_initialize(band);
     _initialized = true;
   }
 }
@@ -59,7 +59,7 @@ void RFManager::freeStaleSources(void)
   for (unsigned char idx=0; idx<RF_SOURCE_COUNT; ++idx)
     if (_sources[idx].isStale())
     {
-      if (_callback) _callback(_sources[idx], Remove);
+      if (_callback) _callback(_sources[idx], RFEVENT_Remove);
       _sources[idx].setId(RFSOURCEID_NONE);
     }
 }
@@ -119,11 +119,13 @@ void RFManager::status(void)
 
 void RFManager::sendUpdate(unsigned char val)
 {
+#if RF_SEND_INTERVAL
   if (!_initialized)
     return;
+  if (++_txCounter < RF_SEND_INTERVAL)
+    return;
+  _txCounter = 0;
 
-  //while (!rf12_canSend())
-  //  rf12_recvDone();
 #define NODEID_MASTER      0x3F
 
 #define HYGRO_BATTERY_OK   0x00
@@ -141,16 +143,8 @@ void RFManager::sendUpdate(unsigned char val)
   outbuf[2] = (val & 0xff);
   outbuf[3] = HYGRO_LMREMOTE_KEY | HYGRO_BATTERY_OK;
 
-#if 0
-  unsigned char v1 = val % 10;
-  unsigned char v10 = (val / 10) % 10;
-  unsigned char v100 = ((val / 100) % 10) + 4;
-  outbuf[1] = ((nodeId & 0x3f) << 6) | _isRecent | v100;
-  outbuf[2] = v10 << 4 | v1;
-  outbuf[3] = HYGRO_NO_HYGRO | HYGRO_BATTERY_OK;
-#endif
-
   rf12_sendStart(outbuf, sizeof(outbuf));
+#endif
 }
 
 boolean RFManager::doWork(void)
@@ -163,7 +157,7 @@ boolean RFManager::doWork(void)
   {
     _lastReceive = millis();
     /*
-    Debug_begin(); print_P(PSTR("RF in"));
+    Debug_begin(); print_P(PSTR("RF in "));
     SerialX.print(rf12_buf[0], HEX); SerialX.print(' ');
     SerialX.print(rf12_buf[1], HEX); SerialX.print(' ');
     SerialX.print(rf12_buf[2], HEX); SerialX.print(' ');
@@ -177,19 +171,19 @@ boolean RFManager::doWork(void)
         
       rf12_packet_t *pkt = (rf12_packet_t *)rf12_buf;
 
-      event e = Update;
+      unsigned char event = RFEVENT_Update;
       unsigned char srcId = ((pkt->byte0 & 0x0f) << 2) | (pkt->byte1 >> 6);
       unsigned char srcIdx = findSourceIdx(srcId);
       if (srcIdx == 0xff)
       {
         srcIdx = findFreeSourceIdx();
-        e = static_cast<event>(Add | Update);
+        event = RFEVENT_Add | RFEVENT_Update;
       }
       if (srcIdx != 0xff)
       {
         _sources[srcIdx].setId(srcId);
         if (_sources[srcIdx].update(pkt))
-          if (_callback) _callback(_sources[srcIdx], e);
+          if (_callback) _callback(_sources[srcIdx], event);
       }
     }  /* if crc ok */
     else if (_crcOk > 0)

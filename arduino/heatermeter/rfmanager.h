@@ -4,14 +4,21 @@
 
 #include <rf12_itplus.h>
 
-#define RFSOURCEID_ANY  0x7f
-#define RFSOURCEID_NONE 0xff
+#define RFSOURCEID_ANY    0x7f
+#define RFSOURCEID_NONE   0xff
 
-#define RF_SOURCE_COUNT 4
+#define RF_SOURCE_COUNT   4
+// Actually transmit the fan speed every RF_SEND_INTERVAL sendUpdate() calls
+// Undefine or set to 0 to disable transmission
+#define RF_SEND_INTERVAL  5
 
 // The count of milliseconds with no receive that the source is considered stale
 // This should be large enough to allow the remote node to sleep
 #define RF_STALE_TIME (3 * 60 * 1000UL)
+
+#define RFSOURCEFLAG_LowBattery   bit(0)
+#define RFSOURCEFLAG_RecentReset  bit(1)
+#define RFSOURCEFLAG_NativeItPlus bit(2)
 
 typedef struct tagRf12Packet
 {
@@ -33,7 +40,6 @@ typedef struct tagRf12Packet
 class RFSource
 {
 public:
-  enum flag { LowBattery = bit(0), RecentReset = bit(1), NativeItPlus = bit(2) };
   RFSource(void) : _id(RFSOURCEID_NONE) {};
   
   // The 6 bitID of the remote node (0-63)
@@ -46,9 +52,9 @@ public:
   unsigned char getRssi(void) const { return _rssi; }
 
   // true if last packet had the low battery flag
-  boolean isBatteryLow(void) const { return _flags & LowBattery; }
+  boolean isBatteryLow(void) const { return _flags & RFSOURCEFLAG_LowBattery; }
   // true if last packet indicated IT+, that value = degrees C * 10
-  boolean isNative(void) const { return _flags & NativeItPlus; }
+  boolean isNative(void) const { return _flags & RFSOURCEFLAG_NativeItPlus; }
   boolean isFree(void) const { return _id == RFSOURCEID_NONE; }
   boolean isStale(void) const { return !isFree() && ((millis() - _lastReceive) > RF_STALE_TIME); }
 
@@ -63,11 +69,14 @@ private:
   unsigned char _rssi;
 };
 
+#define RFEVENT_Add    bit(0)
+#define RFEVENT_Update bit(1)
+#define RFEVENT_Remove bit(2)
+
 class RFManager
 {  
 public:
-  enum event { Add = 0x01, Remove = 0x02, Update = 0x04 };
-  typedef void (*event_callback)(RFSource&, event);
+  typedef void (*event_callback)(RFSource& source, unsigned char event);
 
   RFManager(const event_callback fn) :
     _callback(fn), _crcOk(0x80) {};
@@ -90,6 +99,7 @@ private:
   const event_callback _callback;
   unsigned char _crcOk;
   RFSource _sources[RF_SOURCE_COUNT];
+  unsigned char _txCounter;
 };
 
 #endif /* __RFMANAGER_H__ */
